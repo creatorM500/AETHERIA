@@ -44,27 +44,27 @@ export function SeismicEventCard({
   });
 
   const topOffsetClass =
-    hasActiveRoute && viewportMode === 'globe' ? 'sm:top-44' : 'sm:top-16';
+    hasActiveRoute && viewportMode === 'globe' ? 'sm:top-[156px]' : 'sm:top-[52px]';
 
   return (
     <aside
       aria-label="Ficha del sismo de las últimas 24 horas"
       data-testid="seismic-event-card"
-      className={`fixed bottom-24 left-4 right-4 sm:bottom-auto ${topOffsetClass} sm:left-auto sm:right-[72px] sm:w-[332px] z-20 bg-[#080d16]/96 border border-white/12 rounded-xl p-3.5 shadow-2xl space-y-3`}
+      className={`fixed bottom-[76px] left-3 right-3 sm:bottom-auto ${topOffsetClass} sm:left-auto sm:right-[60px] sm:w-[304px] z-20 bg-[#080d16]/94 border border-white/[0.08] rounded-lg p-3 shadow-2xl space-y-2.5`}
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex items-center gap-2 min-w-0">
           <div
-            className={`px-2.5 py-1 rounded-lg border font-mono-tabular text-sm font-bold shrink-0 ${magColor}`}
+            className={`px-2 py-0.5 rounded border font-mono-tabular text-xs font-bold shrink-0 ${magColor}`}
           >
             M {quake.magnitude.toFixed(1)}
           </div>
           <div className="min-w-0">
-            <div className="flex items-center gap-1.5 text-[11px] text-orange-300 font-medium">
-              <Flame className="w-3.5 h-3.5 shrink-0" />
+            <div className="flex items-center gap-1 text-[10px] text-orange-300 font-medium">
+              <Flame className="w-3 h-3 shrink-0" />
               <span>Sismo 24h · USGS</span>
             </div>
-            <div className="text-[11px] text-slate-400 font-mono-tabular">
+            <div className="text-[10px] text-slate-400 font-mono-tabular truncate">
               {formattedDate} · {formatRelativeSpanish(quake.occurredAtMs)}
             </div>
           </div>
@@ -74,47 +74,49 @@ export function SeismicEventCard({
           type="button"
           onClick={onClose}
           aria-label="Cerrar ficha del sismo"
-          className="p-1 text-slate-400 hover:text-white rounded-md transition-colors shrink-0"
+          className="p-0.5 text-slate-400 hover:text-white rounded transition-colors shrink-0"
         >
-          <X className="w-4 h-4" />
+          <X className="w-3.5 h-3.5" />
         </button>
       </div>
 
-      <div className="space-y-1.5">
-        <h3 className="text-sm font-semibold text-white leading-snug">{quake.place}</h3>
+      <div className="space-y-1">
+        <h3 className="text-xs font-semibold text-white leading-snug">{quake.place}</h3>
         {quake.tsunami && (
-          <div className="flex items-center gap-1.5 text-[11px] font-semibold text-amber-300 bg-amber-500/12 border border-amber-400/30 rounded-md px-2 py-1">
-            <Waves className="w-3.5 h-3.5 shrink-0" />
+          <div className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-300 bg-amber-500/12 border border-amber-400/25 rounded px-2 py-0.5">
+            <Waves className="w-3 h-3 shrink-0" />
             <span>Aviso de vigilancia de tsunami</span>
           </div>
         )}
       </div>
 
-      <dl className="grid grid-cols-3 gap-2 pt-1 border-t border-white/8 text-[11px]">
+      <dl className="grid grid-cols-[1fr_0.85fr_1.25fr] gap-2 pt-2 border-t border-white/[0.07] text-[10px]">
         <div>
           <dt className="text-slate-400">Profundidad</dt>
-          <dd className="font-mono-tabular text-slate-100 font-medium">
+          <dd className="font-mono-tabular text-slate-100 font-medium text-[11px]">
             {quake.depthKm.toFixed(1)} km
           </dd>
         </div>
         <div>
           <dt className="text-slate-400">Relevancia</dt>
-          <dd className="font-mono-tabular text-slate-100 font-medium">{quake.significance}</dd>
+          <dd className="font-mono-tabular text-slate-100 font-medium text-[11px]">
+            {quake.significance}
+          </dd>
         </div>
         <div>
           <dt className="text-slate-400">Epicentro</dt>
-          <dd className="font-mono-tabular text-cyan-300 truncate">
+          <dd className="font-mono-tabular text-cyan-300 text-[11px] whitespace-nowrap">
             {quake.lat.toFixed(2)}°, {quake.lng.toFixed(2)}°
           </dd>
         </div>
       </dl>
 
-      <div className="flex items-center gap-2 pt-1">
+      <div className="flex items-center gap-1.5 pt-0.5">
         <button
           type="button"
           data-testid="seismic-jump-terrain-btn"
           onClick={() => onJumpToTerrain3D(quake)}
-          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-950 rounded-lg transition-colors whitespace-nowrap"
+          className="flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-950 rounded-md transition-colors whitespace-nowrap"
         >
           <Mountain className="w-3.5 h-3.5 shrink-0" />
           <span>Saltar a Terreno 3D</span>
@@ -124,9 +126,9 @@ export function SeismicEventCard({
           type="button"
           onClick={() => onFocusGlobe(quake)}
           title={viewportMode === 'globe' ? 'Centrar en Globo 3D' : 'Volver y enfocar en Globo 3D'}
-          className="flex items-center gap-1 px-2.5 py-2 text-xs font-medium bg-white/8 hover:bg-white/15 text-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+          className="flex items-center gap-1 px-2 py-1.5 text-[11px] font-medium bg-white/8 hover:bg-white/15 text-slate-200 rounded-md transition-colors whitespace-nowrap shrink-0"
         >
-          <Crosshair className="w-3.5 h-3.5" />
+          <Crosshair className="w-3 h-3" />
           <span>Enfocar</span>
         </button>
 
@@ -137,7 +139,7 @@ export function SeismicEventCard({
             rel="noopener noreferrer"
             title="Abrir informe oficial USGS"
             aria-label="Abrir informe oficial USGS en nueva pestaña"
-            className="p-2 text-slate-300 hover:text-cyan-300 bg-white/8 hover:bg-white/15 rounded-lg transition-colors shrink-0"
+            className="p-1.5 text-slate-300 hover:text-cyan-300 bg-white/8 hover:bg-white/15 rounded-md transition-colors shrink-0"
           >
             <ExternalLink className="w-3.5 h-3.5" />
           </a>

@@ -445,7 +445,7 @@ function InteractiveKeyFreeMap({
       />
 
       {/* Top-Left 2D Layer Switcher */}
-      <div className="fixed top-16 left-4 z-10 flex items-center gap-1 p-1 bg-[#080d16]/94 border border-white/8 rounded-lg shadow-lg">
+      <div className="fixed top-[52px] left-3 sm:left-4 z-10 flex items-center gap-1 p-1 bg-[#080d16]/92 border border-white/[0.08] rounded-lg shadow-lg">
         {(
           [
             { id: 'calles', label: 'Calles' },
@@ -457,7 +457,7 @@ function InteractiveKeyFreeMap({
             key={m.id}
             type="button"
             onClick={() => setLayer(m.id)}
-            className={`px-2.5 py-1 text-xs font-medium rounded transition-colors ${
+            className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors ${
               layer === m.id
                 ? 'bg-cyan-500 text-slate-950'
                 : 'text-slate-300 hover:text-white'
@@ -469,13 +469,13 @@ function InteractiveKeyFreeMap({
       </div>
 
       {selectedEventTitle && (
-        <div className="fixed top-28 left-4 z-10 max-w-xs bg-[#080d16]/94 border border-white/8 rounded-lg px-3 py-2 text-xs text-slate-100 shadow-lg">
+        <div className="fixed top-24 left-3 sm:left-4 z-10 max-w-xs bg-[#080d16]/92 border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-[11px] text-slate-100 shadow-lg">
           {selectedEventTitle}
         </div>
       )}
 
       {/* Map Controls (Unified Vertical Bar) */}
-      <div className="fixed top-16 right-4 z-10 flex flex-col divide-y divide-white/8 bg-[#080d16]/94 border border-white/8 rounded-xl overflow-hidden shadow-lg">
+      <div className="fixed top-[52px] right-3 z-10 flex flex-col divide-y divide-white/[0.07] bg-[#080d16]/92 border border-white/[0.08] rounded-lg overflow-hidden shadow-lg">
         <button
           type="button"
           onClick={() => setZoom((z) => Math.min(19, z + 1))}

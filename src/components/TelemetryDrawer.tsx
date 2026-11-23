@@ -144,9 +144,9 @@ export function TelemetryDrawer({
   return (
     <aside
       aria-label="Monitor de Eventos Globales en Tiempo Real"
-      className={`fixed top-16 right-3 left-3 sm:left-auto ${
-        viewTab === 'history' || viewTab === 'alerts' ? 'sm:w-[430px]' : 'sm:w-[385px]'
-      } max-h-[calc(100dvh-84px)] sm:max-h-[calc(100vh-120px)] z-20 flex flex-col bg-[#080d16]/94 border border-white/8 rounded-xl shadow-2xl overflow-hidden transition-[width]`}
+      className={`fixed top-[52px] right-3 left-3 sm:left-auto ${
+        viewTab === 'history' || viewTab === 'alerts' ? 'sm:w-[420px]' : 'sm:w-[376px]'
+      } max-h-[calc(100dvh-76px)] sm:max-h-[calc(100vh-110px)] z-20 flex flex-col bg-[#080d16]/94 border border-white/[0.08] rounded-xl shadow-2xl overflow-hidden transition-[width]`}
     >
       <div className="px-4 py-3 border-b border-white/8 space-y-2.5">
         <div className="flex items-start justify-between gap-2">

@@ -140,7 +140,7 @@ export function McpConsolePanel({ onClose }: McpConsolePanelProps) {
   return (
     <aside
       aria-label="Servidor MCP y Análisis IA en tiempo real"
-      className="fixed top-16 right-3 left-3 sm:left-auto sm:w-[430px] max-h-[calc(100dvh-84px)] sm:max-h-[calc(100vh-155px)] z-20 flex flex-col bg-[#080d16]/94 border border-white/8 rounded-xl shadow-2xl overflow-hidden"
+      className="fixed top-[52px] right-3 left-3 sm:left-auto sm:w-[416px] max-h-[calc(100dvh-76px)] sm:max-h-[calc(100vh-140px)] z-20 flex flex-col bg-[#080d16]/94 border border-white/[0.08] rounded-xl shadow-2xl overflow-hidden"
     >
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/8">
         <div className="flex items-center gap-2">

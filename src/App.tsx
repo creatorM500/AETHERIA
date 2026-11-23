@@ -714,7 +714,7 @@ export default function App() {
       )}
 
       {/* Top Bar Contract: 3 Zones (Wordmark — single-line nav links — 1 primary CTA) */}
-      <header className="fixed top-0 left-0 right-0 h-14 z-30 flex items-center justify-between gap-4 md:gap-8 px-4 md:px-6 bg-[#06090f]/94 border-b border-white/8">
+      <header className="fixed top-0 left-0 right-0 h-11 z-30 flex items-center justify-between gap-3 md:gap-6 px-3 md:px-5 bg-[#06090f]/92 border-b border-white/[0.06]">
         {/* Zone 1: Brand wordmark */}
         <button
           type="button"
@@ -723,7 +723,7 @@ export default function App() {
             setViewportMode('globe');
             setFocusTarget({ lat: 20, lng: -40, zoomDistance: 26, nonce: Date.now() });
           }}
-          className="font-display text-lg font-bold tracking-wider text-white whitespace-nowrap shrink-0 hover:text-cyan-300 transition-colors"
+          className="font-display text-base font-bold tracking-wider text-white whitespace-nowrap shrink-0 hover:text-cyan-300 transition-colors"
         >
           Aetheria
         </button>
@@ -731,12 +731,12 @@ export default function App() {
         {/* Zone 2: Single-line navigation links */}
         <nav
           aria-label="Vistas y módulos principales"
-          className="flex items-center gap-4 md:gap-7 text-xs md:text-sm font-medium overflow-x-auto no-scrollbar"
+          className="flex items-center gap-2.5 sm:gap-5 text-[11px] sm:text-xs font-medium overflow-x-auto no-scrollbar"
         >
           <button
             type="button"
             onClick={() => setViewportMode('globe')}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
+            className={`whitespace-nowrap shrink-0 py-1 border-b-[1.5px] transition-colors ${
               viewportMode === 'globe'
                 ? 'text-cyan-300 border-cyan-400'
                 : 'text-slate-300 border-transparent hover:text-white'
@@ -747,7 +747,7 @@ export default function App() {
           <button
             type="button"
             onClick={handleOpenSectorFromNav}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
+            className={`whitespace-nowrap shrink-0 py-1 border-b-[1.5px] transition-colors ${
               viewportMode === 'sector3d'
                 ? 'text-cyan-300 border-cyan-400'
                 : 'text-slate-300 border-transparent hover:text-white'
@@ -758,7 +758,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setViewportMode('maps')}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
+            className={`whitespace-nowrap shrink-0 py-1 border-b-[1.5px] transition-colors ${
               viewportMode === 'maps'
                 ? 'text-cyan-300 border-cyan-400'
                 : 'text-slate-300 border-transparent hover:text-white'
@@ -774,7 +774,7 @@ export default function App() {
                 prev === 'telemetry' && telemetryTab === 'live' ? 'none' : 'telemetry'
               );
             }}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
+            className={`whitespace-nowrap shrink-0 py-1 border-b-[1.5px] transition-colors ${
               activeDrawer === 'telemetry'
                 ? 'text-cyan-300 border-cyan-400'
                 : 'text-slate-300 border-transparent hover:text-white'
@@ -785,7 +785,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveDrawer((prev) => (prev === 'mcp' ? 'none' : 'mcp'))}
-            className={`hidden sm:inline-block whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
+            className={`hidden sm:inline-block whitespace-nowrap shrink-0 py-1 border-b-[1.5px] transition-colors ${
               activeDrawer === 'mcp'
                 ? 'text-cyan-300 border-cyan-400'
                 : 'text-slate-300 border-transparent hover:text-white'
@@ -802,16 +802,16 @@ export default function App() {
             onClick={() =>
               setActiveDrawer((prev) => (prev === 'navigation' ? 'none' : 'navigation'))
             }
-            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-950 rounded-lg transition-colors whitespace-nowrap shrink-0"
+            className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-950 rounded-md transition-colors whitespace-nowrap shrink-0"
           >
-            <Navigation className="w-3.5 h-3.5" />
+            <Navigation className="w-3 h-3" />
             <span>Navegar</span>
           </button>
         </div>
       </header>
 
       {/* Main Spatial Viewport (100% Unobstructed Center) */}
-      <main className="w-full h-full pt-14 relative">
+      <main className="w-full h-full pt-11 relative">
         {viewportMode === 'maps' ? (
           <GoogleMapsNavigatorView
             apiKey={mapsApiKey}
@@ -855,31 +855,31 @@ export default function App() {
           />
         )}
 
-        {/* Stacked Bottom-Left Dynamic Layer Legends (Wind 3D + 24h Seismic Heatmap) */}
+        {/* Unified Bottom-Left Dynamic Layer Legends (Wind 3D + 24h Seismic Heatmap) */}
         {viewportMode !== 'maps' &&
           activeDrawer === 'none' &&
           ((viewportMode === 'globe' && windLayerEnabled && windField) ||
             (seismicHeatmapEnabled && seismicMetrics)) && (
-            <div className="fixed bottom-20 left-4 z-10 hidden sm:flex flex-col gap-2 w-[248px]">
+            <div className="fixed bottom-16 left-4 sm:left-5 z-10 hidden sm:flex flex-col w-[224px] bg-[#080d16]/90 border border-white/[0.08] rounded-lg divide-y divide-white/[0.07] shadow-xl overflow-hidden">
               {viewportMode === 'globe' && windLayerEnabled && windField && (
                 <aside
                   aria-label="Escala de velocidad del viento global en tiempo real"
                   data-testid="wind-speed-legend"
-                  className="flex flex-col gap-1.5 bg-[#080d16]/94 border border-white/10 rounded-xl px-3 py-2.5 shadow-xl"
+                  className="flex flex-col gap-1 px-2.5 py-2"
                 >
                   <div className="flex items-center justify-between gap-2 text-[11px]">
-                    <span className="flex items-center gap-1.5 font-semibold text-white">
-                      <Wind className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                      <span>Viento Global 3D</span>
+                    <span className="flex items-center gap-1.5 font-medium text-white">
+                      <Wind className="w-3 h-3 text-cyan-400 shrink-0" />
+                      <span>Viento 3D</span>
                     </span>
-                    <span className="font-mono-tabular text-slate-300">
+                    <span className="font-mono-tabular text-[10px] text-slate-400">
                       Prom {windField.metrics.avgSpeedKmh} km/h
                     </span>
                   </div>
 
                   <div
                     aria-hidden="true"
-                    className="h-2 w-full rounded-full border border-white/10"
+                    className="h-1 w-full rounded-full"
                     style={{
                       background:
                         'linear-gradient(90deg, #1785d9 0%, #2dd4bf 22%, #38d673 45%, #facc15 68%, #fa731f 86%, #ffebc7 100%)',
@@ -887,11 +887,9 @@ export default function App() {
                   />
 
                   <div className="flex items-center justify-between text-[10px] font-mono-tabular text-slate-400">
-                    <span>0 km/h</span>
-                    <span>
-                      {Math.round(Math.max(65, windField.metrics.maxSpeedKmh) / 2)} km/h
-                    </span>
-                    <span className="text-cyan-300 font-semibold">
+                    <span>0</span>
+                    <span>{Math.round(Math.max(65, windField.metrics.maxSpeedKmh) / 2)}</span>
+                    <span className="text-cyan-300 font-medium">
                       {Math.max(65, windField.metrics.maxSpeedKmh)}+ km/h
                     </span>
                   </div>
@@ -907,9 +905,9 @@ export default function App() {
                         )
                       }
                       title="Enfocar corriente de viento más intensa en tiempo real"
-                      className="text-left text-[10px] text-slate-300 hover:text-cyan-300 truncate border-t border-white/8 pt-1.5 transition-colors"
+                      className="text-left text-[10px] text-slate-400 hover:text-cyan-300 truncate transition-colors"
                     >
-                      Ráfaga máx {windField.metrics.peakPoint.speedKmh} km/h ·{' '}
+                      Máx {windField.metrics.peakPoint.speedKmh} km/h ·{' '}
                       {windField.metrics.peakPoint.lat.toFixed(1)}°,{' '}
                       {windField.metrics.peakPoint.lng.toFixed(1)}°
                     </button>
@@ -921,21 +919,21 @@ export default function App() {
                 <aside
                   aria-label="Escala térmica sísmica de las últimas 24 horas"
                   data-testid="seismic-heat-legend"
-                  className="flex flex-col gap-1.5 bg-[#080d16]/94 border border-white/10 rounded-xl px-3 py-2.5 shadow-xl"
+                  className="flex flex-col gap-1 px-2.5 py-2"
                 >
                   <div className="flex items-center justify-between gap-2 text-[11px]">
-                    <span className="flex items-center gap-1.5 font-semibold text-white">
-                      <Flame className="w-3.5 h-3.5 text-orange-400 shrink-0" />
-                      <span>Calor Sísmico 24h</span>
+                    <span className="flex items-center gap-1.5 font-medium text-white">
+                      <Flame className="w-3 h-3 text-orange-400 shrink-0" />
+                      <span>Sismos 24h</span>
                     </span>
-                    <span className="font-mono-tabular text-slate-300">
+                    <span className="font-mono-tabular text-[10px] text-slate-400">
                       {seismicMetrics.count24h} eventos
                     </span>
                   </div>
 
                   <div
                     aria-hidden="true"
-                    className="h-2 w-full rounded-full border border-white/10"
+                    className="h-1 w-full rounded-full"
                     style={{
                       background:
                         'linear-gradient(90deg, #083f73 0%, #06b6d4 20%, #22c55e 42%, #facc15 62%, #f97316 80%, #ef4444 93%, #fff0d1 100%)',
@@ -945,7 +943,7 @@ export default function App() {
                   <div className="flex items-center justify-between text-[10px] font-mono-tabular text-slate-400">
                     <span>M{seismicMetrics.minMag.toFixed(1)}</span>
                     <span>M{seismicMetrics.midMag.toFixed(1)}</span>
-                    <span className="text-orange-300 font-semibold">
+                    <span className="text-orange-300 font-medium">
                       M{seismicMetrics.maxMag.toFixed(1)}+
                     </span>
                   </div>
@@ -962,7 +960,7 @@ export default function App() {
                         }
                       }}
                       title="Abrir ficha y enfocar el sismo más fuerte de las últimas 24h"
-                      className="text-left text-[10px] text-slate-300 hover:text-cyan-300 truncate border-t border-white/8 pt-1.5 transition-colors"
+                      className="text-left text-[10px] text-slate-400 hover:text-cyan-300 truncate transition-colors"
                     >
                       Pico M{seismicMetrics.peakQuake.magnitude.toFixed(1)} ·{' '}
                       {seismicMetrics.peakQuake.place}
@@ -977,14 +975,14 @@ export default function App() {
         {viewportMode !== 'maps' && textureMode === 'godseye' && (
           <div
             aria-hidden="true"
-            className="pointer-events-none fixed inset-x-4 top-[60px] bottom-16 z-10"
+            className="pointer-events-none fixed inset-x-2.5 top-[48px] bottom-[62px] z-10"
           >
-            <div className="absolute top-0 left-0 w-5 h-5 border-t border-l border-cyan-400/55" />
-            <div className="absolute top-0 right-0 w-5 h-5 border-t border-r border-cyan-400/55" />
-            <div className="absolute bottom-0 left-0 w-5 h-5 border-b border-l border-cyan-400/55" />
-            <div className="absolute bottom-0 right-0 w-5 h-5 border-b border-r border-cyan-400/55" />
-            <div className="hidden md:flex items-center gap-2 absolute bottom-1.5 right-3 px-2 py-0.5 rounded bg-[#06090f]/78 border border-cyan-500/25 text-[10px] font-mono-tabular tracking-widest uppercase text-cyan-300/90">
-              <span>OJO DE DIOS · BLOQUEO ACTIVO</span>
+            <div className="absolute top-0 left-0 w-3.5 h-3.5 border-t border-l border-cyan-400/35" />
+            <div className="absolute top-0 right-0 w-3.5 h-3.5 border-t border-r border-cyan-400/35" />
+            <div className="absolute bottom-0 left-0 w-3.5 h-3.5 border-b border-l border-cyan-400/35" />
+            <div className="absolute bottom-0 right-0 w-3.5 h-3.5 border-b border-r border-cyan-400/35" />
+            <div className="hidden md:flex items-center gap-1.5 absolute bottom-1 right-2 text-[9px] font-mono-tabular tracking-widest uppercase text-cyan-300/60 drop-shadow-[0_1px_3px_rgba(0,0,0,0.9)]">
+              <span>OJO DE DIOS · BLOQUEO</span>
               <span>·</span>
               <span>
                 {(globeAltitude?.lat ?? activeSector.lat).toFixed(3)}°,{' '}
@@ -996,7 +994,7 @@ export default function App() {
 
         {/* Unified Top-Left HUD Column: QuickSearchBar + Quiet Context Readout + Live Terreno 3D Coords + Alert Toasts */}
         {viewportMode !== 'maps' && activeDrawer === 'none' && (
-          <div className="fixed top-[64px] left-4 sm:left-6 z-20 flex flex-col gap-2 items-start pointer-events-none max-w-[calc(100vw-88px)]">
+          <div className="fixed top-[56px] left-4 sm:left-5 z-20 flex flex-col gap-1.5 items-start pointer-events-none max-w-[calc(100vw-72px)]">
             <QuickSearchBar
               viewportMode={viewportMode}
               onFlyToGlobe={(lat, lng) => handleFlyTo(lat, lng, 14.5)}
@@ -1006,10 +1004,10 @@ export default function App() {
             />
 
             <div
-              className={`pointer-events-none hidden md:flex items-center gap-2 text-xs text-slate-300/95 ${
+              className={`pointer-events-none hidden md:flex items-center gap-1.5 text-[11px] text-slate-300/90 ${
                 viewportMode === 'sector3d'
-                  ? 'bg-[#06090f]/82 border border-white/8 rounded-lg px-2.5 py-1 shadow-lg'
-                  : 'drop-shadow-[0_1px_4px_rgba(0,0,0,0.9)]'
+                  ? 'bg-[#06090f]/75 border border-white/[0.06] rounded-md px-2 py-0.5 shadow-md'
+                  : 'drop-shadow-[0_1px_4px_rgba(0,0,0,0.95)]'
               }`}
             >
               <span className="font-medium text-white">
@@ -1022,21 +1020,15 @@ export default function App() {
                 <span className="font-mono-tabular text-slate-300">
                   {terrainStats?.loading
                     ? terrainStats.stage === 'buildings'
-                      ? 'Extruyendo edificios OSM...'
-                      : 'Cargando elevación DEM...'
+                      ? 'Extruyendo OSM...'
+                      : 'Cargando DEM...'
                     : terrainStats?.stage === 'error'
                       ? 'Error cargando DEM'
                       : terrainStats
-                        ? `${terrainStats.minElevationM}–${terrainStats.maxElevationM} m · ${terrainStats.buildingsCount.toLocaleString('es-ES')} edificios · ${terrainStats.spanKm} km${
-                            terrainStats.chunksLoaded ? ` (${terrainStats.chunksLoaded} sectores)` : ''
-                          } · Calidad ${
-                            terrainStats.qualityTier === 'ultra'
-                              ? 'Alta'
-                              : terrainStats.qualityTier === 'balanced'
-                                ? 'Media'
-                                : 'Eco'
+                        ? `${terrainStats.minElevationM}–${terrainStats.maxElevationM} m · ${terrainStats.buildingsCount.toLocaleString('es-ES')} edif. · ${terrainStats.spanKm} km${
+                            terrainStats.chunksLoaded ? ` (${terrainStats.chunksLoaded} sect.)` : ''
                           }`
-                        : 'DEM Terrarium + OSM 3D'}
+                        : 'DEM + OSM 3D'}
                 </span>
               ) : (
                 <span className="font-mono-tabular text-slate-300">
@@ -1068,23 +1060,23 @@ export default function App() {
                 data-testid="terrain-live-coords"
                 onClick={handleCopyTerrainCoords}
                 title="Clic para copiar latitud y longitud"
-                className="pointer-events-auto flex flex-wrap items-center gap-x-2 gap-y-0.5 bg-[#080d16]/94 hover:border-cyan-400/45 border border-white/10 rounded-lg px-2.5 py-1 shadow-lg text-[11px] font-mono-tabular text-slate-200 transition-colors"
+                className="pointer-events-auto flex flex-wrap items-center gap-x-1.5 gap-y-0.5 bg-[#080d16]/90 hover:border-cyan-400/45 border border-white/[0.08] rounded-md px-2 py-0.5 shadow-lg text-[11px] font-mono-tabular text-slate-200 transition-colors"
               >
                 <span className="text-cyan-300 font-semibold">
                   {(liveTerrainCoords?.lat ?? activeSector.lat).toFixed(5)}°,{' '}
                   {(liveTerrainCoords?.lng ?? activeSector.lng).toFixed(5)}°
                 </span>
-                <span aria-hidden="true" className="text-slate-500">
+                <span aria-hidden="true" className="text-slate-600">
                   ·
                 </span>
                 <span>
-                  Terreno {(liveTerrainCoords?.groundElevM ?? terrainStats?.minElevationM ?? 0)} m
+                  Suelo {(liveTerrainCoords?.groundElevM ?? terrainStats?.minElevationM ?? 0)} m
                 </span>
-                <span aria-hidden="true" className="text-slate-500">
+                <span aria-hidden="true" className="text-slate-600">
                   ·
                 </span>
-                <span>Cámara {(liveTerrainCoords?.cameraAltM ?? 0)} m</span>
-                <span aria-hidden="true" className="text-slate-500">
+                <span>Cám {(liveTerrainCoords?.cameraAltM ?? 0)} m</span>
+                <span aria-hidden="true" className="text-slate-600">
                   ·
                 </span>
                 <span className="text-slate-400">
@@ -1113,8 +1105,10 @@ export default function App() {
         {/* Unified Vertical 3D Viewport Controls (+, -, Calle / Terreno aquí) */}
         {viewportMode !== 'maps' && activeDrawer === 'none' && (
           <div
-            className={`fixed right-3 sm:right-4 z-10 flex flex-col divide-y divide-white/8 bg-[#080d16]/94 border border-white/8 rounded-xl overflow-hidden shadow-lg transition-all ${
-              activeRoute && viewportMode === 'globe' && pickMode === 'none' ? 'top-44' : 'top-16'
+            className={`fixed right-4 z-10 flex flex-col divide-y divide-white/[0.07] bg-[#080d16]/90 border border-white/[0.08] rounded-lg overflow-hidden shadow-lg transition-all ${
+              activeRoute && viewportMode === 'globe' && pickMode === 'none'
+                ? 'top-[156px]'
+                : 'top-[56px]'
             }`}
           >
             <button
@@ -1125,9 +1119,9 @@ export default function App() {
               }}
               aria-label={viewportMode === 'sector3d' ? 'Acercar Terreno 3D' : 'Acercar Globo 3D'}
               title="Acercar"
-              className="p-2 hover:bg-white/10 text-slate-200 transition-colors"
+              className="p-1.5 hover:bg-white/10 text-slate-200 transition-colors"
             >
-              <ZoomIn className="w-4 h-4" />
+              <ZoomIn className="w-3.5 h-3.5" />
             </button>
             <button
               type="button"
@@ -1137,9 +1131,9 @@ export default function App() {
               }}
               aria-label={viewportMode === 'sector3d' ? 'Alejar Terreno 3D' : 'Alejar Globo 3D'}
               title="Alejar"
-              className="p-2 hover:bg-white/10 text-slate-200 transition-colors"
+              className="p-1.5 hover:bg-white/10 text-slate-200 transition-colors"
             >
-              <ZoomOut className="w-4 h-4" />
+              <ZoomOut className="w-3.5 h-3.5" />
             </button>
             {viewportMode === 'globe' ? (
               <>
@@ -1151,7 +1145,7 @@ export default function App() {
                   }}
                   aria-label="Zoom máximo a nivel de calle en el Globo 3D"
                   title="Bajar a nivel de calle (z19)"
-                  className="px-2 py-1.5 text-[11px] font-medium hover:bg-white/10 text-cyan-300 transition-colors"
+                  className="px-1.5 py-1 text-[10px] font-medium hover:bg-white/10 text-cyan-300 transition-colors"
                 >
                   Calle
                 </button>
@@ -1160,13 +1154,13 @@ export default function App() {
                   onClick={() => setPickMode((m) => (m === 'terrain' ? 'none' : 'terrain'))}
                   aria-label="Abrir Terreno 3D haciendo clic en cualquier punto del globo"
                   title="Abrir Terreno 3D en cualquier coordenada"
-                  className={`p-2 flex items-center justify-center transition-colors ${
+                  className={`p-1.5 flex items-center justify-center transition-colors ${
                     pickMode === 'terrain'
                       ? 'bg-cyan-500 text-slate-950'
                       : 'hover:bg-white/10 text-slate-200 hover:text-cyan-300'
                   }`}
                 >
-                  <Mountain className="w-4 h-4" />
+                  <Mountain className="w-3.5 h-3.5" />
                 </button>
               </>
             ) : (
@@ -1176,7 +1170,7 @@ export default function App() {
                   onClick={() => setZoomSignal({ action: 'street', nonce: Date.now() })}
                   aria-label="Acercar Terreno 3D a nivel de calles y edificios"
                   title="Bajar entre los edificios 3D"
-                  className="px-2 py-1.5 text-[11px] font-medium hover:bg-white/10 text-cyan-300 transition-colors"
+                  className="px-1.5 py-1 text-[10px] font-medium hover:bg-white/10 text-cyan-300 transition-colors"
                 >
                   Calle
                 </button>
@@ -1185,9 +1179,9 @@ export default function App() {
                   onClick={() => setViewportMode('globe')}
                   aria-label="Volver al Globo 3D"
                   title="Volver al Globo 3D"
-                  className="p-2 flex items-center justify-center hover:bg-white/10 text-slate-200 hover:text-cyan-300 transition-colors"
+                  className="p-1.5 flex items-center justify-center hover:bg-white/10 text-slate-200 hover:text-cyan-300 transition-colors"
                 >
-                  <Globe2 className="w-4 h-4" />
+                  <Globe2 className="w-3.5 h-3.5" />
                 </button>
               </>
             )}
@@ -1196,10 +1190,10 @@ export default function App() {
 
         {/* Globe Pick Mode Banner */}
         {pickMode !== 'none' && viewportMode === 'globe' && (
-          <div className="fixed top-16 left-1/2 -translate-x-1/2 z-30 flex items-center gap-3 bg-[#080d16]/96 border border-cyan-400/45 text-xs text-white px-4 py-2 rounded-lg shadow-xl">
-            <MapPin className="w-4 h-4 text-cyan-400 shrink-0" />
+          <div className="fixed top-[52px] left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 bg-[#080d16]/94 border border-cyan-400/40 text-xs text-white px-3 py-1.5 rounded-lg shadow-xl">
+            <MapPin className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
             <span>
-              Haz clic en cualquier punto del Globo 3D para{' '}
+              Haz clic en el Globo 3D para{' '}
               <strong>
                 {pickMode === 'terrain'
                   ? 'abrir Terreno 3D'
@@ -1212,7 +1206,7 @@ export default function App() {
               type="button"
               onClick={() => setPickMode('none')}
               aria-label="Cancelar selección en el globo"
-              className="p-1 text-slate-400 hover:text-white"
+              className="p-0.5 text-slate-400 hover:text-white"
             >
               <X className="w-3.5 h-3.5" />
             </button>
@@ -1222,13 +1216,13 @@ export default function App() {
         {/* Active 3D Globe Route Navigation HUD */}
         {activeRoute && viewportMode === 'globe' && pickMode === 'none' && (
           <div
-            className={`fixed top-16 right-3 left-3 sm:left-auto sm:right-4 sm:w-[340px] z-10 bg-[#080d16]/94 border border-white/10 rounded-xl p-3 shadow-xl space-y-2 ${
+            className={`fixed top-[52px] right-3 left-3 sm:left-auto sm:right-3 sm:w-[310px] z-10 bg-[#080d16]/92 border border-white/[0.08] rounded-lg p-2.5 shadow-xl space-y-1.5 ${
               activeDrawer !== 'none' ? 'hidden sm:block' : 'block'
             }`}
           >
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-[11px] text-cyan-300 font-medium truncate">
+                <div className="text-[10px] text-cyan-300 font-medium truncate">
                   {activeRoute.originLabel} → {activeRoute.destinationLabel}
                 </div>
                 <div className="text-xs text-white font-semibold font-mono-tabular">
@@ -1244,18 +1238,18 @@ export default function App() {
                   }
                   setFlyAlongActive((v) => !v);
                 }}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg shrink-0 transition-colors ${
+                className={`flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-md shrink-0 transition-colors ${
                   flyAlongActive
                     ? 'bg-amber-500 text-slate-950 hover:bg-amber-400'
                     : 'bg-cyan-500 text-slate-950 hover:bg-cyan-400'
                 }`}
               >
-                {flyAlongActive ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                {flyAlongActive ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
                 <span>{flyAlongActive ? 'Pausar' : 'Volar ruta'}</span>
               </button>
             </div>
             {currentFlyStep && (
-              <div className="text-[11px] text-slate-200 bg-[#06090f] border border-white/8 rounded-lg px-2.5 py-1.5">
+              <div className="text-[10px] text-slate-300 border-t border-white/[0.07] pt-1.5 truncate">
                 <span className="text-cyan-400 font-mono-tabular mr-1.5">
                   [{currentFlyStep.index}/{currentFlyStep.total}]
                 </span>
@@ -1353,11 +1347,11 @@ export default function App() {
 
       {/* Unified Single-Row Collapsible Bottom Control Dock (Zero Viewport Occlusion) */}
       <div
-        className={`fixed bottom-3 inset-x-0 mx-auto w-fit max-w-[calc(100vw-16px)] z-20 flex-col items-center transition-transform duration-200 ${
+        className={`fixed bottom-2.5 inset-x-0 mx-auto w-fit max-w-[calc(100vw-16px)] z-20 flex-col items-center transition-transform duration-200 ${
           activeDrawer !== 'none' ? 'hidden sm:flex' : 'flex'
         }`}
         style={{
-          transform: dockExpanded ? 'translateY(0)' : 'translateY(calc(100% - 28px))',
+          transform: dockExpanded ? 'translateY(0)' : 'translateY(calc(100% - 22px))',
         }}
       >
         <button
@@ -1365,37 +1359,39 @@ export default function App() {
           onClick={() => setDockExpanded((v) => !v)}
           aria-expanded={dockExpanded}
           aria-label={dockExpanded ? 'Ocultar panel de controles' : 'Mostrar panel de controles'}
-          className="flex items-center gap-1 px-2.5 py-0.5 text-[11px] text-slate-400 hover:text-white bg-[#080d16]/94 border border-b-0 border-white/8 rounded-t-lg transition-colors whitespace-nowrap"
+          className="flex items-center gap-1 px-2 py-0.5 text-[10px] text-slate-400 hover:text-white bg-[#080d16]/90 border border-b-0 border-white/[0.08] rounded-t-md transition-colors whitespace-nowrap"
         >
           {dockExpanded ? (
             <>
-              <ChevronDown className="w-3 h-3" />
+              <ChevronDown className="w-2.5 h-2.5" />
               <span>Ocultar</span>
             </>
           ) : (
             <>
-              <ChevronUp className="w-3 h-3 text-cyan-400" />
+              <ChevronUp className="w-2.5 h-2.5 text-cyan-400" />
               <span>Controles</span>
             </>
           )}
         </button>
 
-        <div className="w-full bg-[#080d16]/94 border border-white/8 rounded-xl shadow-2xl px-2 py-1.5 flex flex-wrap items-center justify-center gap-2">
+        <div className="w-full bg-[#080d16]/92 border border-white/[0.08] rounded-lg shadow-2xl px-1.5 py-1 flex flex-nowrap sm:flex-wrap items-center justify-start sm:justify-center gap-1 overflow-x-auto no-scrollbar">
           {/* Category Filter Segmented Control (Globe) or Relief Exaggeration + Quality (Terreno 3D) */}
           {viewportMode === 'sector3d' ? (
-            <div className="flex items-center gap-2 overflow-x-auto max-w-full no-scrollbar">
+            <div className="flex items-center gap-1.5 shrink-0">
               <div
                 role="group"
                 aria-label="Exageración vertical del relieve 3D"
                 className="flex items-center gap-0.5"
               >
-                <span className="hidden sm:inline text-[11px] text-slate-400 mr-1 whitespace-nowrap">Relieve</span>
+                <span className="hidden sm:inline text-[10px] text-slate-400 px-1 whitespace-nowrap">
+                  Relieve
+                </span>
                 {([1, 1.5, 2.2] as const).map((ex) => (
                   <button
                     key={ex}
                     type="button"
                     onClick={() => setTerrainExaggeration(ex)}
-                    className={`px-2 py-1 text-xs font-mono-tabular font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                    className={`px-1.5 py-0.5 text-[11px] font-mono-tabular font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
                       terrainExaggeration === ex
                         ? 'bg-cyan-500 text-slate-950'
                         : 'text-slate-300 hover:text-white hover:bg-white/5'
@@ -1406,14 +1402,13 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="w-px h-4 bg-white/10" aria-hidden="true" />
+              <div className="w-px h-3.5 bg-white/10" aria-hidden="true" />
 
               <div
                 role="group"
                 aria-label="Perfil de calidad adaptativa"
                 className="flex items-center gap-0.5"
               >
-                <span className="hidden sm:inline text-[11px] text-slate-400 mr-1 whitespace-nowrap">Calidad</span>
                 {(
                   [
                     { id: 'auto', label: 'Auto' },
@@ -1425,9 +1420,9 @@ export default function App() {
                     key={q.id}
                     type="button"
                     onClick={() => setQualityPreference(q.id)}
-                    className={`px-2 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                    className={`px-1.5 py-0.5 text-[11px] font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
                       qualityPreference === q.id
-                        ? 'bg-white/15 text-cyan-300'
+                        ? 'bg-white/12 text-cyan-300'
                         : 'text-slate-400 hover:text-white'
                     }`}
                   >
@@ -1440,7 +1435,7 @@ export default function App() {
             <div
               role="group"
               aria-label="Filtrar eventos por categoría"
-              className="flex items-center gap-0.5 overflow-x-auto max-w-full no-scrollbar"
+              className="flex items-center gap-0.5 shrink-0"
             >
               {categoryTabs.map((tab) => {
                 const active = categoryFilter === tab.id;
@@ -1449,7 +1444,7 @@ export default function App() {
                     key={tab.id}
                     type="button"
                     onClick={() => setCategoryFilter(tab.id)}
-                    className={`px-2.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
+                    className={`px-2 py-1 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 ${
                       active
                         ? 'bg-cyan-500 text-slate-950'
                         : 'text-slate-300 hover:text-white hover:bg-white/5'
@@ -1457,7 +1452,7 @@ export default function App() {
                   >
                     <span>{tab.label}</span>
                     <span
-                      className={`font-mono-tabular text-[11px] ${
+                      className={`font-mono-tabular text-[10px] ${
                         active ? 'text-slate-900' : 'text-slate-500'
                       }`}
                     >
@@ -1469,15 +1464,15 @@ export default function App() {
             </div>
           )}
 
-          <div className="hidden md:block w-px h-5 bg-white/10" aria-hidden="true" />
+          <div className="hidden md:block w-px h-4 bg-white/10" aria-hidden="true" />
 
           {/* Dynamic Globe & Terrain Texture Mode */}
           <div
             role="group"
             aria-label="Textura dinámica del mapa 3D"
-            className="flex items-center gap-0.5"
+            className="flex items-center gap-0.5 shrink-0"
           >
-            <Layers className="w-3.5 h-3.5 text-slate-500 mr-1 shrink-0" />
+            <Layers className="w-3 h-3 text-slate-500 mx-0.5 shrink-0" />
             {(
               [
                 { id: 'godseye', label: 'Ojo de Dios' },
@@ -1490,9 +1485,9 @@ export default function App() {
                 key={m.id}
                 type="button"
                 onClick={() => setTextureMode(m.id)}
-                className={`px-2 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                className={`px-1.5 py-1 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                   textureMode === m.id
-                    ? 'bg-white/15 text-cyan-300'
+                    ? 'bg-white/12 text-cyan-300'
                     : 'text-slate-400 hover:text-white'
                 }`}
               >
@@ -1501,10 +1496,10 @@ export default function App() {
             ))}
           </div>
 
-          <div className="hidden md:block w-px h-5 bg-white/10" aria-hidden="true" />
+          <div className="hidden md:block w-px h-4 bg-white/10" aria-hidden="true" />
 
           {/* Compact Sector 3D Selector + Quiet Utility Controls */}
-          <div className="flex items-center gap-1 overflow-x-auto max-w-full no-scrollbar">
+          <div className="flex items-center gap-0.5 shrink-0">
             <select
               value={activeSector.id}
               onChange={(e) => {
@@ -1513,7 +1508,7 @@ export default function App() {
               }}
               aria-label="Seleccionar sector 3D"
               title="Cambiar de sector geográfico"
-              className="max-w-[150px] px-2 py-1 text-xs bg-[#06090f] border border-white/10 rounded-lg text-slate-200 focus:outline-none focus:border-cyan-400"
+              className="max-w-[126px] px-1.5 py-0.5 text-[11px] bg-[#06090f] border border-white/[0.08] rounded-md text-slate-200 focus:outline-none focus:border-cyan-400"
             >
               {!isPresetSector && (
                 <option value={activeSector.id}>{activeSector.name}</option>
@@ -1531,9 +1526,9 @@ export default function App() {
                 onClick={() => setAutoRotate((r) => !r)}
                 aria-label="Alternar rotación orbital automática"
                 title="Rotación automática"
-                className={`p-1.5 rounded-lg transition-colors ${
+                className={`p-1 rounded-md transition-colors ${
                   autoRotate
-                    ? 'bg-white/15 text-cyan-300'
+                    ? 'bg-white/12 text-cyan-300'
                     : 'text-slate-400 hover:text-white hover:bg-white/5'
                 }`}
               >
@@ -1555,19 +1550,14 @@ export default function App() {
               aria-pressed={windLayerEnabled && viewportMode === 'globe'}
               aria-label="Alternar capa 3D de partículas de viento en tiempo real sobre el globo"
               title="Capa de viento 3D en tiempo real"
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
                 windLayerEnabled && viewportMode === 'globe'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-400/35'
-                  : 'text-slate-300 hover:text-white hover:bg-white/5 border border-transparent'
+                  ? 'bg-cyan-500/15 text-cyan-300'
+                  : 'text-slate-300 hover:text-white hover:bg-white/5'
               }`}
             >
-              <Wind className="w-3.5 h-3.5 shrink-0" />
+              <Wind className="w-3 h-3 shrink-0" />
               <span>Viento</span>
-              {windField && (
-                <span className="font-mono-tabular text-[11px] opacity-85">
-                  {windField.metrics.maxSpeedKmh}
-                </span>
-              )}
             </button>
 
             <button
@@ -1576,16 +1566,16 @@ export default function App() {
               aria-pressed={seismicHeatmapEnabled}
               aria-label="Alternar capa de calor sísmico de las últimas 24 horas"
               title="Capa de calor sísmico 24h"
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
                 seismicHeatmapEnabled
-                  ? 'bg-orange-500/20 text-orange-300 border border-orange-400/35'
-                  : 'text-slate-300 hover:text-white hover:bg-white/5 border border-transparent'
+                  ? 'bg-orange-500/15 text-orange-300'
+                  : 'text-slate-300 hover:text-white hover:bg-white/5'
               }`}
             >
-              <Flame className="w-3.5 h-3.5 shrink-0" />
-              <span>Sismos 24h</span>
+              <Flame className="w-3 h-3 shrink-0" />
+              <span>Sismos</span>
               {seismicMetrics && (
-                <span className="font-mono-tabular text-[11px] opacity-85">
+                <span className="font-mono-tabular text-[10px] opacity-80">
                   {seismicMetrics.count24h}
                 </span>
               )}
@@ -1601,13 +1591,13 @@ export default function App() {
               }}
               aria-label="Abrir historial guardado de desastres naturales"
               title="Historial por categoría de desastres"
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
                 activeDrawer === 'telemetry' && telemetryTab === 'history'
-                  ? 'bg-cyan-500/20 text-cyan-300'
+                  ? 'bg-cyan-500/15 text-cyan-300'
                   : 'text-slate-300 hover:text-white hover:bg-white/5'
               }`}
             >
-              <History className="w-3.5 h-3.5" />
+              <History className="w-3 h-3" />
               <span>Historial</span>
             </button>
 
@@ -1622,18 +1612,18 @@ export default function App() {
               }}
               aria-label="Configurar alertas y ver notificaciones de telemetría"
               title="Alertas por umbrales sísmicos y meteorológicos"
-              className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
                 activeDrawer === 'telemetry' && telemetryTab === 'alerts'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-400/35'
+                  ? 'bg-cyan-500/15 text-cyan-300'
                   : unreadAlertCount > 0
-                    ? 'bg-amber-500/15 text-amber-300 border border-amber-400/30 hover:bg-amber-500/25'
-                    : 'text-slate-300 hover:text-white hover:bg-white/5 border border-transparent'
+                    ? 'bg-amber-500/12 text-amber-300 hover:bg-amber-500/20'
+                    : 'text-slate-300 hover:text-white hover:bg-white/5'
               }`}
             >
-              <Bell className="w-3.5 h-3.5 shrink-0" />
+              <Bell className="w-3 h-3 shrink-0" />
               <span>Alertas</span>
               {unreadAlertCount > 0 && (
-                <span className="font-mono-tabular text-[11px] font-semibold">
+                <span className="font-mono-tabular text-[10px] font-semibold">
                   {unreadAlertCount}
                 </span>
               )}
@@ -1644,15 +1634,15 @@ export default function App() {
               onClick={() => void fetchWorldEvents()}
               aria-label="Actualizar telemetría en tiempo real"
               title="Actualizar ahora"
-              className="p-1.5 rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-white/5 transition-colors"
+              className="p-1 rounded-md text-slate-400 hover:text-cyan-300 hover:bg-white/5 transition-colors"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
+              <RefreshCw className="w-3 h-3" />
             </button>
 
             <button
               type="button"
               onClick={() => setActiveDrawer((prev) => (prev === 'mcp' ? 'none' : 'mcp'))}
-              className="sm:hidden flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-cyan-300 hover:bg-white/5 rounded-lg whitespace-nowrap shrink-0"
+              className="sm:hidden flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium text-cyan-300 hover:bg-white/5 rounded-md whitespace-nowrap shrink-0"
             >
               <Cpu className="w-3 h-3" />
               <span>MCP</span>
