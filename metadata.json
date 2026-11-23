@@ -1,0 +1,6 @@
+{
+  "name": "Aetheria Global",
+  "description": "Globo terráqueo 3D WebGL en tiempo real con monitoreo global de desastres, vuelos, barcos, conflictos, terreno y edificios 3D, asistente de navegación predictiva con Google Maps y servidor MCP para análisis con IA.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
