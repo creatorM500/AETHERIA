@@ -13,6 +13,7 @@ interface StoredChunkRecord {
 }
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
+const TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 
 function openTerrainDb(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null);
@@ -28,9 +29,27 @@ function openTerrainDb(): Promise<IDBDatabase | null> {
           store.createIndex('lastAccessedAt', 'lastAccessedAt', { unique: false });
         }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => {
+          db.close();
+          dbPromise = null;
+        };
+        db.onclose = () => {
+          dbPromise = null;
+        };
+        resolve(db);
+      };
+      req.onerror = () => {
+        dbPromise = null;
+        resolve(null);
+      };
+      req.onblocked = () => {
+        dbPromise = null;
+        resolve(null);
+      };
     } catch {
+      dbPromise = null;
       resolve(null);
     }
   });
@@ -43,7 +62,7 @@ export async function getPersistedTerrainChunk(key: string): Promise<TerrainChun
 
   return new Promise<TerrainChunkPayload | null>((resolve) => {
     try {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const tx = db.transaction(STORE_NAME, 'readonly');
       const store = tx.objectStore(STORE_NAME);
       const req = store.get(key);
       req.onsuccess = () => {
@@ -54,16 +73,28 @@ export async function getPersistedTerrainChunk(key: string): Promise<TerrainChun
         }
         const now = Date.now();
         if (now - rec.cachedAt > CACHE_TTL_MS) {
-          store.delete(key);
+          try {
+            const delTx = db.transaction(STORE_NAME, 'readwrite');
+            delTx.objectStore(STORE_NAME).delete(key);
+          } catch {
+            // Ignore cleanup failure
+          }
           resolve(null);
           return;
         }
-        rec.lastAccessedAt = now;
-        store.put(rec);
+        if (now - rec.lastAccessedAt > TOUCH_INTERVAL_MS) {
+          try {
+            const touchTx = db.transaction(STORE_NAME, 'readwrite');
+            touchTx.objectStore(STORE_NAME).put({ ...rec, lastAccessedAt: now });
+          } catch {
+            // Ignore non-critical LRU timestamp update
+          }
+        }
         resolve(rec.payload);
       };
       req.onerror = () => resolve(null);
     } catch {
+      dbPromise = null;
       resolve(null);
     }
   });
@@ -105,6 +136,6 @@ export async function putPersistedTerrainChunk(
       };
     };
   } catch {
-    // Ignore storage quota or private mode restrictions
+    dbPromise = null;
   }
 }

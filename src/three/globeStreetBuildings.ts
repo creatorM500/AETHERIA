@@ -18,7 +18,7 @@ import {
 const EARTH_RADIUS_M = 6_371_000;
 const Z14_COUNT = 16384;
 const MAX_CONCURRENT_CHUNKS = 4;
-const MAX_CACHED_CHUNKS = 14;
+const MAX_CACHED_CHUNKS = 10;
 
 interface GlobeChunkEntry {
   key: string;
@@ -194,7 +194,7 @@ export class GlobeStreetBuildingsManager {
           const payload = (await res.json()) as TerrainChunkPayload;
           if (this.disposed || controller.signal.aborted) return;
 
-          if (this.payloadCache.size >= 24) {
+          if (this.payloadCache.size >= 6) {
             const oldest = this.payloadCache.keys().next().value;
             if (oldest) this.payloadCache.delete(oldest);
           }

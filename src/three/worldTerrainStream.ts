@@ -18,7 +18,10 @@ import type {
   QualityTier,
   TerrainChunkPayload,
   TerrainHudStats,
+  TerrainRoadPolyline,
 } from '../shared/types.ts';
+import { buildAllChunkGeometriesRaw } from '../shared/terrainGeometryBuilder.ts';
+import { findNearestRoadInNormalizedTile } from '../shared/trafficCamera.ts';
 import { rawBuffersToThreeGeometry } from './fastBuildingExtruder.ts';
 import {
   applyGodsEyeBuildingShader,
@@ -29,7 +32,10 @@ import {
 } from './godsEyeVisuals.ts';
 import { createRealisticWaterMaterial } from './waterShader.ts';
 import { TerrainGeometryWorkerPool } from './workerGeometryPool.ts';
-import { streamSingleTileTextureIntoCanvas } from './worldTiles.ts';
+import {
+  streamSingleTileTextureIntoCanvas,
+  trimTileCanvasCaches,
+} from './worldTiles.ts';
 import {
   getPersistedTerrainChunk,
   putPersistedTerrainChunk,
@@ -39,12 +45,12 @@ const UNIT_TILE_WIDTH = 48; // 1 z=14 tile = 48 scene units (~2.4 km)
 const Z14_COUNT = 16384; // 2^14
 const Z12_COUNT = 4096; // 2^12
 const MAX_CONCURRENT_CHUNK_FETCHES = 10;
-const MAX_PAYLOAD_CACHE = 128;
-const MAX_GPU_CHUNKS = 84; // 49 z=14 (7x7) + 25 z=12 (5x5) + panning buffer
-const TARGET_SIMULTANEOUS_BUILDINGS = 185_000;
+const MAX_PAYLOAD_CACHE = 12;
+const MAX_GPU_CHUNKS = 76; // 49 z=14 (7x7) + 25 z=12 (5x5) + small panning buffer
 
 interface ActiveTerrainChunk {
   key: string;
+  detailKey: string;
   tier: 1 | 2;
   dist2: number;
   isCoreTile: boolean;
@@ -62,11 +68,17 @@ interface ActiveTerrainChunk {
   roadsMesh: THREE.Mesh | null;
   waterMesh: THREE.Mesh | null;
   payload: TerrainChunkPayload;
+  roadsIndex: TerrainRoadPolyline[];
+  hasWaterFeatures: boolean;
+  hasRoads: boolean;
+  hasBuildings: boolean;
   chunkWidth: number;
   chunkDepth: number;
   builtExaggeration: number;
+  builtWaterExaggeration: number;
   buildingsBuilt: number;
   buildingsPending: boolean;
+  needsRehydrate: boolean;
   workerBuilding: boolean;
   buildEpoch: number;
   lastUsedMs: number;
@@ -262,6 +274,7 @@ export class GlobalTerrainStreamManager {
   public readonly root = new THREE.Group();
   private chunksGroup = new THREE.Group();
   private routeGroup = new THREE.Group();
+  private cameraMarkerGroup = new THREE.Group();
 
   private uniforms: GodsEyeShaderUniforms;
   private textureMode: GlobeTextureMode;
@@ -275,6 +288,7 @@ export class GlobalTerrainStreamManager {
   private towerBuildingMat: THREE.MeshStandardMaterial;
   private roadNetworkMat: THREE.MeshStandardMaterial;
   private waterSurfaceMat: THREE.ShaderMaterial;
+  private waterTier2Mat: THREE.ShaderMaterial;
   private workerPool: TerrainGeometryWorkerPool;
 
   private originTx = 0;
@@ -352,7 +366,7 @@ export class GlobalTerrainStreamManager {
       tileSize: { value: new THREE.Vector2(UNIT_TILE_WIDTH, UNIT_TILE_WIDTH) },
     };
 
-    this.root.add(this.chunksGroup, this.routeGroup);
+    this.root.add(this.chunksGroup, this.routeGroup, this.cameraMarkerGroup);
 
     this.stdBuildingMat = new THREE.MeshStandardMaterial({
       vertexColors: true,
@@ -382,6 +396,11 @@ export class GlobalTerrainStreamManager {
     applyRoadNetworkShader(this.roadNetworkMat, this.uniforms);
 
     this.waterSurfaceMat = createRealisticWaterMaterial(this.uniforms);
+    this.waterTier2Mat = createRealisticWaterMaterial(
+      this.uniforms,
+      undefined,
+      this.tier1MaskBinding
+    );
     this.workerPool = new TerrainGeometryWorkerPool(2);
 
     this.anchorWin = computeSingleTileWindow(14, 0, 0);
@@ -418,6 +437,7 @@ export class GlobalTerrainStreamManager {
 
   public setAnchor(lat: number, lng: number) {
     this.clearActiveChunks();
+    this.payloadCache.clear();
     this.cancelAllFetches();
     this.buildQueue = [];
     this.sessionBaseElevM = null;
@@ -549,6 +569,166 @@ export class GlobalTerrainStreamManager {
     return { point: pt, lat: ll.lat, lng: ll.lng };
   }
 
+  public pickRoadAtRay(raycaster: THREE.Raycaster): {
+    road: TerrainRoadPolyline;
+    lat: number;
+    lng: number;
+    elevationM: number;
+    bearingDeg: number;
+    worldPoint: THREE.Vector3;
+  } | null {
+    // Raycast terrainMesh (whose CPU vertex/index buffers stay resident; roadsMesh releases CPU arrays after GPU upload)
+    const tHit = this.raycastTerrain(raycaster);
+    if (!tHit || !Number.isFinite(tHit.point.x) || !Number.isFinite(tHit.point.z)) {
+      return null;
+    }
+
+    const hitLL = tHit.lat !== undefined && Number.isFinite(tHit.lat) && Number.isFinite(tHit.lng)
+      ? { lat: tHit.lat, lng: tHit.lng }
+      : this.worldXZToLatLng(tHit.point.x, tHit.point.z);
+    if (!Number.isFinite(hitLL.lat) || !Number.isFinite(hitLL.lng)) return null;
+
+    const centerTx = Math.floor(lngToTileX(hitLL.lng, 14));
+    const centerTy = clamp(Math.floor(latToTileY(hitLL.lat, 14)), 0, Z14_COUNT - 1);
+    const maxDistNorm = 0.055;
+
+    let bestResult: {
+      road: TerrainRoadPolyline;
+      lat: number;
+      lng: number;
+      bearingDeg: number;
+      distNorm: number;
+    } | null = null;
+
+    const hitFTx = lngToTileX(hitLL.lng, 14);
+    const hitFTy = latToTileY(hitLL.lat, 14);
+
+    for (let dy = -1; dy <= 1; dy++) {
+      const ty = centerTy + dy;
+      if (ty < 0 || ty >= Z14_COUNT) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const tx = (((centerTx + dx) % Z14_COUNT) + Z14_COUNT) % Z14_COUNT;
+        const chunk = this.activeChunks.get(`14/${tx}/${ty}`);
+        if (!chunk || chunk.roadsIndex.length === 0) continue;
+
+        let localU = hitFTx - tx;
+        if (localU > Z14_COUNT / 2) localU -= Z14_COUNT;
+        if (localU < -Z14_COUNT / 2) localU += Z14_COUNT;
+        const localV = hitFTy - ty;
+
+        const candidate = findNearestRoadInNormalizedTile(
+          chunk.roadsIndex,
+          localU,
+          localV,
+          maxDistNorm
+        );
+        if (!candidate) continue;
+        if (!bestResult || candidate.distNorm < bestResult.distNorm) {
+          const snapLng = tileXToLng(((tx + candidate.u) % Z14_COUNT + Z14_COUNT) % Z14_COUNT, 14);
+          const snapLat = tileYToLat(clamp(ty + candidate.v, 0.001, Z14_COUNT - 0.001), 14);
+          bestResult = {
+            road: candidate.road,
+            lat: snapLat,
+            lng: snapLng,
+            bearingDeg: candidate.bearingDeg,
+            distNorm: candidate.distNorm,
+          };
+        }
+      }
+    }
+
+    if (!bestResult) return null;
+
+    const [wx, wz] = this.latLngToWorldXZ(bestResult.lat, bestResult.lng);
+    const wy = this.sampleHeightAtWorldXZ(wx, wz);
+    const elevM = this.sampleElevationMetersAtWorldXZ(wx, wz) ?? 0;
+    return {
+      road: bestResult.road,
+      lat: bestResult.lat,
+      lng: bestResult.lng,
+      elevationM: Math.round(elevM),
+      bearingDeg: bestResult.bearingDeg,
+      worldPoint: new THREE.Vector3(wx, wy, wz),
+    };
+  }
+
+  private clearCameraMarker() {
+    while (this.cameraMarkerGroup.children.length > 0) {
+      const child = this.cameraMarkerGroup.children[0];
+      if (child instanceof THREE.Mesh || child instanceof THREE.Line) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+      this.cameraMarkerGroup.remove(child);
+    }
+  }
+
+  public setTrafficCameraMarker(
+    marker: { lat: number; lng: number; bearingDeg: number } | null
+  ) {
+    this.clearCameraMarker();
+    if (!marker) return;
+
+    const [wx, wz] = this.latLngToWorldXZ(marker.lat, marker.lng);
+    const wy = this.sampleHeightAtWorldXZ(wx, wz);
+
+    // Road anchor ring
+    const ringGeo = new THREE.RingGeometry(0.45, 0.72, 28);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0x22d3ee,
+      transparent: true,
+      opacity: 0.92,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+    ringMesh.position.set(wx, wy + 0.16, wz);
+    ringMesh.renderOrder = 9;
+
+    // Vertical camera mast + glowing CCTV node
+    const mastPts = [
+      new THREE.Vector3(wx, wy + 0.16, wz),
+      new THREE.Vector3(wx, wy + 2.35, wz),
+    ];
+    const mastGeo = new THREE.BufferGeometry().setFromPoints(mastPts);
+    const mastMat = new THREE.LineBasicMaterial({
+      color: 0x67e8f9,
+      transparent: true,
+      opacity: 0.88,
+    });
+    const mastLine = new THREE.Line(mastGeo, mastMat);
+    mastLine.renderOrder = 9;
+
+    const headGeo = new THREE.SphereGeometry(0.26, 12, 10);
+    const headMat = new THREE.MeshBasicMaterial({
+      color: 0x22d3ee,
+    });
+    const headMesh = new THREE.Mesh(headGeo, headMat);
+    headMesh.position.set(wx, wy + 2.45, wz);
+    headMesh.renderOrder = 9;
+
+    // Directional FOV cone wedge showing camera aim along road bearing
+    const fovGeo = new THREE.ConeGeometry(0.75, 1.85, 16, 1, true);
+    fovGeo.rotateX(Math.PI / 2);
+    const fovMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.24,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const fovMesh = new THREE.Mesh(fovGeo, fovMat);
+    const bearingRad = (marker.bearingDeg * Math.PI) / 180;
+    const dirX = Math.sin(bearingRad);
+    const dirZ = -Math.cos(bearingRad);
+    fovMesh.position.set(wx + dirX * 0.95, wy + 1.85, wz + dirZ * 0.95);
+    fovMesh.lookAt(wx + dirX * 4.5, wy + 0.35, wz + dirZ * 4.5);
+    fovMesh.renderOrder = 8;
+
+    this.cameraMarkerGroup.add(ringMesh, mastLine, headMesh, fovMesh);
+  }
+
   public setTextureMode(mode: GlobeTextureMode) {
     if (this.textureMode === mode) return;
     const prevWasSatFamily = this.textureMode === 'satellite' || this.textureMode === 'godseye';
@@ -563,7 +743,10 @@ export class GlobalTerrainStreamManager {
     for (const chunk of this.activeChunks.values()) {
       chunk.textureEpoch += 1;
       const myEpoch = chunk.textureEpoch;
-      const highRes = (chunk.isCoreTile || chunk.tier === 2) && !this.isSoftwareGl;
+      const highRes =
+        (chunk.isCoreTile || chunk.tier === 2) &&
+        !this.isSoftwareGl &&
+        chunk.canvas.width >= 512;
       void streamSingleTileTextureIntoCanvas(
         mode,
         chunk.zoom,
@@ -580,6 +763,152 @@ export class GlobalTerrainStreamManager {
     }
   }
 
+  private getTargetSimultaneousBuildings(): number {
+    if (this.qualityTier === 'eco') return 115_000;
+    if (this.qualityTier === 'balanced') return 145_000;
+    return 175_000;
+  }
+
+  private pruneChunkVectorPayload(chunk: ActiveTerrainChunk) {
+    if (
+      chunk.payload.buildings.length === 0 &&
+      (chunk.payload.roads?.length ?? 0) === 0 &&
+      (chunk.payload.waterFeatures?.length ?? 0) === 0
+    ) {
+      return;
+    }
+    chunk.payload = {
+      ...chunk.payload,
+      buildings: [],
+      roads: [],
+      waterFeatures: [],
+    };
+    this.payloadCache.delete(chunk.detailKey);
+  }
+
+  private async dispatchChunkWorkerBuild(
+    chunk: ActiveTerrainChunk,
+    buildEpoch: number,
+    skipBuildingsForCap: boolean,
+    rehydrateFirst: boolean
+  ) {
+    const key = chunk.key;
+    try {
+      let payload = chunk.payload;
+      if (rehydrateFirst) {
+        const [gridSizeStr, maxBuildingsStr] = chunk.detailKey.split(':').slice(1);
+        const idbKey = `v4:${chunk.detailKey}`;
+        let hydrated =
+          this.payloadCache.get(chunk.detailKey) ?? (await getPersistedTerrainChunk(idbKey));
+        if (this.disposed) return;
+        if (!hydrated) {
+          const url = `/api/terrain/chunk?z=${chunk.zoom}&tx=${chunk.tx}&ty=${chunk.ty}&gridSize=${
+            gridSizeStr || '49'
+          }&buildings=${chunk.tier === 1 ? 1 : 0}&maxBuildings=${maxBuildingsStr || '0'}`;
+          const res = await fetch(url);
+          if (!res.ok) return;
+          hydrated = (await res.json()) as TerrainChunkPayload;
+          if (this.disposed) return;
+          void putPersistedTerrainChunk(idbKey, hydrated);
+        }
+        payload = {
+          ...chunk.payload,
+          buildings: hydrated.buildings,
+          roads: hydrated.roads,
+          waterFeatures: hydrated.waterFeatures,
+        };
+        if (chunk.tier === 1 && chunk.roadsIndex.length === 0 && hydrated.roads?.length) {
+          chunk.roadsIndex = hydrated.roads.slice();
+        }
+      }
+
+      const targetBeforeBuild = this.activeChunks.get(key);
+      if (!targetBeforeBuild || targetBeforeBuild.buildEpoch !== buildEpoch) {
+        return;
+      }
+
+      const buildPayload: TerrainChunkPayload = skipBuildingsForCap
+        ? { ...payload, buildings: [] }
+        : payload;
+      const base = this.sessionBaseElevM ?? payload.minElevationM;
+      const skipWaterForWorker =
+        chunk.waterMesh !== null &&
+        Math.abs(chunk.builtWaterExaggeration - this.verticalExaggeration) < 0.01;
+      if (!skipWaterForWorker) {
+        chunk.builtWaterExaggeration = this.verticalExaggeration;
+      }
+
+      const rawOut = await this.workerPool.buildChunkGeometry(key, {
+        payload: buildPayload,
+        baseElevationM: base,
+        metersToSceneY: this.metersToSceneY,
+        chunkWidth: chunk.chunkWidth,
+        chunkDepth: chunk.chunkDepth,
+        verticalExaggeration: this.verticalExaggeration,
+        seedOffset: chunk.tx * 13 + chunk.ty * 31,
+        includeHoles: chunk.isCoreTile,
+        includeRoadsAndWater: chunk.tier === 1,
+        includeWater:
+          chunk.tier === 2 &&
+          (payload.minElevationM <= 0.42 || chunk.hasWaterFeatures),
+        skipWater: skipWaterForWorker,
+      });
+
+      if (this.disposed) return;
+      const targetChunk = this.activeChunks.get(key);
+      if (!targetChunk) return;
+      if (targetChunk.buildEpoch !== buildEpoch) {
+        if (targetChunk.buildingsPending && !this.buildQueue.includes(key)) {
+          this.buildQueue.unshift(key);
+        }
+        return;
+      }
+
+      this.applyChunkGeometryOutput(targetChunk, {
+        stdGeo: rawBuffersToThreeGeometry(rawOut.stdGeo),
+        towerGeo: rawBuffersToThreeGeometry(rawOut.towerGeo),
+        roadsGeo: rawBuffersToThreeGeometry(rawOut.roadsGeo),
+        waterGeo: skipWaterForWorker ? undefined : rawBuffersToThreeGeometry(rawOut.waterGeo),
+        builtCount: rawOut.builtCount,
+      });
+      // Free heavy OSM building/road/water arrays from JS heap now that GPU buffers exist
+      this.pruneChunkVectorPayload(targetChunk);
+    } catch {
+      const targetChunk = this.activeChunks.get(key);
+      if (targetChunk && !this.disposed && targetChunk.buildingsPending && !this.buildQueue.includes(key)) {
+        this.buildQueue.push(key);
+      }
+    } finally {
+      this.activeWorkerBuilds = Math.max(0, this.activeWorkerBuilds - 1);
+      const targetChunk = this.activeChunks.get(key);
+      if (targetChunk) {
+        targetChunk.workerBuilding = false;
+      }
+      if (!this.disposed && this.buildQueue.length === 0 && this.activeWorkerBuilds === 0) {
+        this.emitCurrentStats(true);
+      }
+    }
+  }
+
+  public trimMemory() {
+    this.payloadCache.clear();
+    trimTileCanvasCaches();
+    this.cancelAllFetches();
+    this.lastCenterKey = '';
+
+    for (const [key, chunk] of Array.from(this.activeChunks.entries())) {
+      if (!chunk.isCoreTile) {
+        this.disposeChunk(chunk);
+        this.activeChunks.delete(key);
+        this.desiredKeys.delete(key);
+      } else if (!chunk.buildingsPending && !chunk.workerBuilding) {
+        this.pruneChunkVectorPayload(chunk);
+      }
+    }
+    this.buildQueue = this.buildQueue.filter((key) => this.activeChunks.has(key));
+    this.refreshTier1Mask();
+  }
+
   public setVerticalExaggeration(exag: number) {
     if (Math.abs(this.verticalExaggeration - exag) < 0.01) return;
     this.verticalExaggeration = exag;
@@ -594,14 +923,38 @@ export class GlobalTerrainStreamManager {
         base
       );
       chunk.group.position.y = chunk.tier === 2 ? -0.10 : 0;
+      const needsTier2Water =
+        chunk.waterMesh !== null ||
+        chunk.payload.minElevationM <= 0.42 ||
+        chunk.hasWaterFeatures;
+
       if (chunk.tier === 1) {
         chunk.buildEpoch += 1;
+        const hasNeededVectors =
+          (!chunk.hasBuildings || chunk.payload.buildings.length > 0) &&
+          (!chunk.hasRoads || (chunk.payload.roads?.length ?? 0) > 0) &&
+          (!chunk.hasWaterFeatures || (chunk.payload.waterFeatures?.length ?? 0) > 0);
+        chunk.needsRehydrate = !hasNeededVectors;
+        chunk.buildingsPending = true;
+        if (!this.buildQueue.includes(chunk.key)) {
+          this.buildQueue.push(chunk.key);
+        }
+      } else if (needsTier2Water) {
+        chunk.buildEpoch += 1;
+        const missingWaterVectors =
+          chunk.hasWaterFeatures && (chunk.payload.waterFeatures?.length ?? 0) === 0;
+        chunk.needsRehydrate = missingWaterVectors;
         chunk.buildingsPending = true;
         if (!this.buildQueue.includes(chunk.key)) {
           this.buildQueue.push(chunk.key);
         }
       }
     }
+    this.buildQueue.sort((ka, kb) => {
+      const ca = this.activeChunks.get(ka);
+      const cb = this.activeChunks.get(kb);
+      return (ca?.dist2 ?? 99) - (cb?.dist2 ?? 99);
+    });
     this.rebuildRouteRibbon();
   }
 
@@ -630,6 +983,39 @@ export class GlobalTerrainStreamManager {
   public updateFocusWorldXZ(worldX: number, worldZ: number) {
     const ll = this.worldXZToLatLng(worldX, worldZ);
     this.updateFocusLatLng(ll.lat, ll.lng);
+  }
+
+  private getChunkBuildSpec(
+    tier: 1 | 2,
+    isCoreTile: boolean,
+    dist2 = 0
+  ): { gridSize: number; maxBuildings: number } {
+    const gridSize =
+      tier === 1
+        ? this.qualityTier === 'ultra'
+          ? 65
+          : 49
+        : this.qualityTier === 'eco'
+          ? 33
+          : 49;
+    const maxBuildings =
+      tier === 1
+        ? isCoreTile
+          ? 18000
+          : dist2 <= 8
+            ? this.qualityTier === 'eco'
+              ? 11000
+              : 14000
+            : this.qualityTier === 'eco'
+              ? 7500
+              : 10500
+        : 0;
+    return { gridSize, maxBuildings };
+  }
+
+  private getPayloadCacheKey(key: string, tier: 1 | 2, isCoreTile: boolean, dist2 = 0): string {
+    const { gridSize, maxBuildings } = this.getChunkBuildSpec(tier, isCoreTile, dist2);
+    return `${key}:${gridSize}:${maxBuildings}`;
   }
 
   public updateFocusLatLng(lat: number, lng: number) {
@@ -666,9 +1052,10 @@ export class GlobalTerrainStreamManager {
         continue;
       }
 
-      const cachedPayload = this.payloadCache.get(key);
+      const detailKey = this.getPayloadCacheKey(key, 1, isCoreTile, item.dist2);
+      const cachedPayload = this.payloadCache.get(detailKey);
       if (cachedPayload) {
-        this.attachChunkFromPayload(key, 1, item.dist2, isCoreTile, cachedPayload);
+        this.attachChunkFromPayload(key, detailKey, 1, item.dist2, isCoreTile, cachedPayload);
         continue;
       }
 
@@ -699,9 +1086,10 @@ export class GlobalTerrainStreamManager {
         continue;
       }
 
-      const cachedPayload = this.payloadCache.get(key);
+      const detailKey = this.getPayloadCacheKey(key, 2, false, item.dist2);
+      const cachedPayload = this.payloadCache.get(detailKey);
       if (cachedPayload) {
-        this.attachChunkFromPayload(key, 2, item.dist2, false, cachedPayload);
+        this.attachChunkFromPayload(key, detailKey, 2, item.dist2, false, cachedPayload);
         continue;
       }
 
@@ -714,7 +1102,7 @@ export class GlobalTerrainStreamManager {
           zoom: 12,
           tx: item.tx,
           ty: item.ty,
-          priority: 24 + item.dist2,
+          priority: 6 + item.dist2,
         });
       }
     }
@@ -769,22 +1157,12 @@ export class GlobalTerrainStreamManager {
       const controller = new AbortController();
       this.inflightControllers.set(spec.key, controller);
 
-      const gridSize =
-        spec.tier === 1
-          ? this.qualityTier === 'ultra'
-            ? 65
-            : 49
-          : 49;
-      const maxBuildings =
-        spec.tier === 1
-          ? spec.isCoreTile
-            ? 18000
-            : 16000
-          : 0;
+      const { gridSize, maxBuildings } = this.getChunkBuildSpec(spec.tier, spec.isCoreTile, spec.dist2);
+      const detailKey = `${spec.key}:${gridSize}:${maxBuildings}`;
       const url = `/api/terrain/chunk?z=${spec.zoom}&tx=${spec.tx}&ty=${spec.ty}&gridSize=${gridSize}&buildings=${
         spec.tier === 1 ? 1 : 0
       }&maxBuildings=${maxBuildings}`;
-      const idbKey = `v2:${spec.key}:${gridSize}:${spec.tier === 1 ? maxBuildings : 0}`;
+      const idbKey = `v4:${detailKey}`;
 
       void (async () => {
         try {
@@ -803,11 +1181,12 @@ export class GlobalTerrainStreamManager {
             const oldest = this.payloadCache.keys().next().value;
             if (oldest) this.payloadCache.delete(oldest);
           }
-          this.payloadCache.set(spec.key, payload);
+          this.payloadCache.set(detailKey, payload);
 
           if (this.desiredKeys.has(spec.key) && !this.activeChunks.has(spec.key)) {
             this.attachChunkFromPayload(
               spec.key,
+              detailKey,
               spec.tier,
               spec.dist2,
               spec.isCoreTile,
@@ -826,6 +1205,7 @@ export class GlobalTerrainStreamManager {
 
   private attachChunkFromPayload(
     key: string,
+    detailKey: string,
     tier: 1 | 2,
     dist2: number,
     isCoreTile: boolean,
@@ -854,18 +1234,17 @@ export class GlobalTerrainStreamManager {
       tier === 1 ? 4.5 : 2.5
     );
 
+    // Match texture dimensions 1:1 to fetched Esri tile grids (2x2 256px = 512px, 1x 256px = 256px)
     const texPx =
       tier === 1
         ? isCoreTile
           ? this.isSoftwareGl
-            ? 512
-            : 1024
-          : this.isSoftwareGl
             ? 256
             : 512
-        : this.isSoftwareGl
-          ? 256
-          : 512;
+          : 256
+        : this.qualityTier === 'ultra' && !this.isSoftwareGl
+          ? 512
+          : 256;
     const canvas = document.createElement('canvas');
     canvas.width = texPx;
     canvas.height = texPx;
@@ -888,15 +1267,17 @@ export class GlobalTerrainStreamManager {
     terrainMesh.receiveShadow = this.shadowsEnabled;
     group.add(terrainMesh);
 
-    const hasWaterOrRoads =
-      tier === 1 &&
-      (payload.minElevationM <= 0.35 ||
-        Boolean(payload.roads?.length) ||
-        Boolean(payload.waterFeatures?.length));
-    const needsGeometryBuild = tier === 1 && (payload.buildings.length > 0 || hasWaterOrRoads);
+    const hasWaterFeatures = Boolean(payload.waterFeatures?.length);
+    const hasRoads = Boolean(payload.roads?.length);
+    const hasBuildings = payload.buildings.length > 0;
+    const hasWaterSurface = payload.minElevationM <= 0.42 || hasWaterFeatures;
+    const hasImmediateNonBuilding =
+      hasWaterSurface || (tier === 1 && !hasBuildings && hasRoads);
+    const needsTier1WorkerBuild = tier === 1 && hasBuildings;
 
     const chunk: ActiveTerrainChunk = {
       key,
+      detailKey,
       tier,
       dist2,
       isCoreTile,
@@ -914,11 +1295,17 @@ export class GlobalTerrainStreamManager {
       roadsMesh: null,
       waterMesh: null,
       payload,
+      roadsIndex: tier === 1 && payload.roads ? payload.roads.slice() : [],
+      hasWaterFeatures,
+      hasRoads,
+      hasBuildings,
       chunkWidth,
       chunkDepth,
       builtExaggeration: this.verticalExaggeration,
+      builtWaterExaggeration: hasWaterSurface ? this.verticalExaggeration : -1,
       buildingsBuilt: 0,
-      buildingsPending: needsGeometryBuild,
+      buildingsPending: needsTier1WorkerBuild,
+      needsRehydrate: false,
       workerBuilding: false,
       buildEpoch: 1,
       lastUsedMs: performance.now(),
@@ -932,7 +1319,7 @@ export class GlobalTerrainStreamManager {
     }
 
     const myEpoch = chunk.textureEpoch;
-    const highRes = (isCoreTile || tier === 2) && !this.isSoftwareGl;
+    const highRes = (isCoreTile || tier === 2) && !this.isSoftwareGl && texPx >= 512;
     void streamSingleTileTextureIntoCanvas(
       this.textureMode,
       payload.zoom,
@@ -947,6 +1334,32 @@ export class GlobalTerrainStreamManager {
       }
     );
 
+    if (hasImmediateNonBuilding) {
+      const base = this.sessionBaseElevM ?? payload.minElevationM;
+      const syncOut = buildAllChunkGeometriesRaw({
+        payload: { ...payload, buildings: [] },
+        baseElevationM: base,
+        metersToSceneY: this.metersToSceneY,
+        chunkWidth,
+        chunkDepth,
+        verticalExaggeration: this.verticalExaggeration,
+        seedOffset: payload.tx * 13 + payload.ty * 31,
+        includeHoles: false,
+        includeRoadsAndWater: tier === 1 && !hasBuildings && hasRoads,
+        includeWater: hasWaterSurface,
+        skipWater: !hasWaterSurface,
+      });
+      if (syncOut.roadsGeo || syncOut.waterGeo) {
+        this.applyChunkGeometryOutput(chunk, {
+          stdGeo: null,
+          towerGeo: null,
+          roadsGeo: rawBuffersToThreeGeometry(syncOut.roadsGeo),
+          waterGeo: rawBuffersToThreeGeometry(syncOut.waterGeo),
+          builtCount: 0,
+        });
+      }
+    }
+
     if (chunk.buildingsPending) {
       this.buildQueue.push(key);
       this.buildQueue.sort((ka, kb) => {
@@ -954,6 +1367,9 @@ export class GlobalTerrainStreamManager {
         const cb = this.activeChunks.get(kb);
         return (ca?.dist2 ?? 99) - (cb?.dist2 ?? 99);
       });
+    } else {
+      // No worker build queued: immediately free heavy OSM vector arrays from JS heap
+      this.pruneChunkVectorPayload(chunk);
     }
 
     if (!this.anchorSignaled && tier === 1) {
@@ -982,7 +1398,7 @@ export class GlobalTerrainStreamManager {
       stdGeo: ReturnType<typeof rawBuffersToThreeGeometry>;
       towerGeo: ReturnType<typeof rawBuffersToThreeGeometry>;
       roadsGeo: ReturnType<typeof rawBuffersToThreeGeometry>;
-      waterGeo: ReturnType<typeof rawBuffersToThreeGeometry>;
+      waterGeo?: ReturnType<typeof rawBuffersToThreeGeometry>;
       builtCount: number;
     }
   ) {
@@ -1001,7 +1417,7 @@ export class GlobalTerrainStreamManager {
       chunk.group.remove(chunk.roadsMesh);
       chunk.roadsMesh = null;
     }
-    if (chunk.waterMesh) {
+    if (output.waterGeo !== undefined && chunk.waterMesh) {
       chunk.waterMesh.geometry.dispose();
       chunk.group.remove(chunk.waterMesh);
       chunk.waterMesh = null;
@@ -1030,7 +1446,10 @@ export class GlobalTerrainStreamManager {
       chunk.roadsMesh = m;
     }
     if (output.waterGeo) {
-      const m = new THREE.Mesh(output.waterGeo, this.waterSurfaceMat);
+      const mat = chunk.tier === 2 ? this.waterTier2Mat : this.waterSurfaceMat;
+      const m = new THREE.Mesh(output.waterGeo, mat);
+      // Offset Tier-2 water upward by +0.10 to match Tier-1 seaY despite chunk.group.y = -0.10
+      m.position.y = chunk.tier === 2 ? 0.10 : 0;
       m.renderOrder = 2;
       chunk.group.add(m);
       chunk.waterMesh = m;
@@ -1053,6 +1472,7 @@ export class GlobalTerrainStreamManager {
       if (c.tier === 1) currentTotalBuildings += c.buildingsBuilt;
     }
 
+    const targetBuildings = this.getTargetSimultaneousBuildings();
     const maxConcurrentWorkerBuilds = this.workerPool.isWorkerBacked ? 4 : 1;
     while (this.buildQueue.length > 0 && this.activeWorkerBuilds < maxConcurrentWorkerBuilds) {
       const key = this.buildQueue.shift()!;
@@ -1060,56 +1480,21 @@ export class GlobalTerrainStreamManager {
       if (!chunk || !chunk.buildingsPending || chunk.workerBuilding) continue;
 
       chunk.buildingsPending = false;
+      const rehydrateFirst = chunk.needsRehydrate;
+      chunk.needsRehydrate = false;
       chunk.builtExaggeration = this.verticalExaggeration;
 
-      const { payload } = chunk;
       const skipBuildingsForCap =
-        !chunk.isCoreTile && currentTotalBuildings >= TARGET_SIMULTANEOUS_BUILDINGS;
-      const buildPayload: TerrainChunkPayload = skipBuildingsForCap
-        ? { ...payload, buildings: [] }
-        : payload;
-
-      const base = this.sessionBaseElevM ?? payload.minElevationM;
+        chunk.tier === 2 || (!chunk.isCoreTile && currentTotalBuildings >= targetBuildings);
       const buildEpoch = chunk.buildEpoch;
       chunk.workerBuilding = true;
       this.activeWorkerBuilds += 1;
 
-      void this.workerPool
-        .buildChunkGeometry(key, {
-          payload: buildPayload,
-          baseElevationM: base,
-          metersToSceneY: this.metersToSceneY,
-          chunkWidth: chunk.chunkWidth,
-          chunkDepth: chunk.chunkDepth,
-          verticalExaggeration: this.verticalExaggeration,
-          seedOffset: chunk.tx * 13 + chunk.ty * 31,
-          includeHoles: chunk.isCoreTile,
-          includeRoadsAndWater: chunk.tier === 1,
-        })
-        .then((rawOut) => {
-          this.activeWorkerBuilds = Math.max(0, this.activeWorkerBuilds - 1);
-          if (this.disposed) return;
-          const targetChunk = this.activeChunks.get(key);
-          if (!targetChunk || targetChunk.buildEpoch !== buildEpoch) return;
-          targetChunk.workerBuilding = false;
+      void this.dispatchChunkWorkerBuild(chunk, buildEpoch, skipBuildingsForCap, rehydrateFirst);
 
-          this.applyChunkGeometryOutput(targetChunk, {
-            stdGeo: rawBuffersToThreeGeometry(rawOut.stdGeo),
-            towerGeo: rawBuffersToThreeGeometry(rawOut.towerGeo),
-            roadsGeo: rawBuffersToThreeGeometry(rawOut.roadsGeo),
-            waterGeo: rawBuffersToThreeGeometry(rawOut.waterGeo),
-            builtCount: rawOut.builtCount,
-          });
-        })
-        .catch(() => {
-          this.activeWorkerBuilds = Math.max(0, this.activeWorkerBuilds - 1);
-          const targetChunk = this.activeChunks.get(key);
-          if (targetChunk) targetChunk.workerBuilding = false;
-        });
-
-      // Optimistically reserve count to avoid over-dispatching beyond 185k
+      // Optimistically reserve count to avoid over-dispatching beyond tier cap
       if (!skipBuildingsForCap) {
-        currentTotalBuildings += buildPayload.buildings.length;
+        currentTotalBuildings += chunk.payload.buildings.length || chunk.buildingsBuilt;
       }
     }
   }
@@ -1204,6 +1589,8 @@ export class GlobalTerrainStreamManager {
     chunk.terrainGeo.dispose();
     chunk.terrainMat.dispose();
     chunk.texture.dispose();
+    chunk.canvas.width = 0;
+    chunk.canvas.height = 0;
     if (chunk.stdMesh) chunk.stdMesh.geometry.dispose();
     if (chunk.towerMesh) chunk.towerMesh.geometry.dispose();
     if (chunk.roadsMesh) chunk.roadsMesh.geometry.dispose();
@@ -1231,6 +1618,7 @@ export class GlobalTerrainStreamManager {
     this.disposed = true;
     this.cancelAllFetches();
     this.clearActiveChunks();
+    this.clearCameraMarker();
     this.payloadCache.clear();
     this.workerPool.dispose();
     while (this.routeGroup.children.length > 0) {
@@ -1245,6 +1633,7 @@ export class GlobalTerrainStreamManager {
     this.towerBuildingMat.dispose();
     this.roadNetworkMat.dispose();
     this.waterSurfaceMat.dispose();
+    this.waterTier2Mat.dispose();
     this.tier1MaskTex.dispose();
   }
 }

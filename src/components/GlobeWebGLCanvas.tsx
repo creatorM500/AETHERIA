@@ -14,6 +14,7 @@ import {
 } from '../shared/terrainMath.ts';
 import type {
   GlobalEvent,
+  GlobalWeatherRadarResponse,
   GlobalWindFieldResponse,
   GlobeTextureMode,
   LiveTerrainCoords,
@@ -23,24 +24,37 @@ import type {
   SeismicHeatScaleMetrics,
   SeismicQuake24h,
   TerrainHudStats,
+  TrafficCameraFeedPoint,
   ViewportMode,
 } from '../shared/types.ts';
+import { buildTrafficCameraFeedPoint } from '../shared/trafficCamera.ts';
 import {
   GodsEyeOrbitalConstellation,
   GodsEyeTargetReticle,
   type GodsEyeShaderUniforms,
 } from '../three/godsEyeVisuals.ts';
+import { computeSubSolarPoint } from '../shared/solarPosition.ts';
 import {
+  buildPlanetaryDemTextures,
   createCloudTexture,
   createGlobeTextures,
+  createNightLightsTexture,
 } from '../three/proceduralTextures.ts';
 import {
   GlobeSeismicHeatmapLayer,
   TerrainSeismicHeatmapLayer,
 } from '../three/seismicHeatmapLayer.ts';
 import { GlobeWindParticleLayer } from '../three/windParticleLayer.ts';
+import { GlobeWeatherRadarLayer } from '../three/weatherRadarLayer.ts';
+import { getTerrainAtmospherePalette, TerrainSkyDome } from '../three/skyDome.ts';
 import { GlobalTerrainStreamManager } from '../three/worldTerrainStream.ts';
-import { createAtmosphereMaterial, createOuterHaloMaterial } from '../three/shaders.ts';
+import {
+  applyCloudTerminatorShader,
+  applyGlobeTerminatorShader,
+  createAtmosphereMaterial,
+  createOuterHaloMaterial,
+  type GlobeSolarUniforms,
+} from '../three/shaders.ts';
 import {
   GlobeRegionalTileManager,
   streamPlanetaryTilesIntoCanvas,
@@ -82,6 +96,16 @@ interface GlobeWebGLCanvasProps {
   onLiveTerrainCoordsChange?: (coords: LiveTerrainCoords) => void;
   windLayerEnabled?: boolean;
   windField?: GlobalWindFieldResponse | null;
+  windCycloneEvents?: GlobalEvent[];
+  weatherRadarEnabled?: boolean;
+  weatherRadarField?: GlobalWeatherRadarResponse | null;
+  trafficCameraPoint?: {
+    lat: number;
+    lng: number;
+    bearingDeg: number;
+    focusNonce?: number;
+  } | null;
+  onSelectTrafficCamera?: (camera: TrafficCameraFeedPoint | null) => void;
 }
 
 const GLOBE_RADIUS = 10;
@@ -134,6 +158,11 @@ export function GlobeWebGLCanvas({
   onLiveTerrainCoordsChange,
   windLayerEnabled = true,
   windField = null,
+  windCycloneEvents,
+  weatherRadarEnabled = true,
+  weatherRadarField = null,
+  trafficCameraPoint = null,
+  onSelectTrafficCamera,
 }: GlobeWebGLCanvasProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [contextLost, setContextLost] = useState(false);
@@ -149,6 +178,7 @@ export function GlobeWebGLCanvas({
     onTerrainStatsChange,
     onSelectQuake24h,
     onLiveTerrainCoordsChange,
+    onSelectTrafficCamera,
   });
   callbacksRef.current = {
     onSelectEvent,
@@ -161,9 +191,11 @@ export function GlobeWebGLCanvas({
     onTerrainStatsChange,
     onSelectQuake24h,
     onLiveTerrainCoordsChange,
+    onSelectTrafficCamera,
   };
 
   const propsRef = useRef({
+    events,
     viewportMode,
     autoRotate,
     selectedEvent,
@@ -179,8 +211,12 @@ export function GlobeWebGLCanvas({
     seismicMetrics,
     windLayerEnabled,
     windField,
+    windCycloneEvents,
+    weatherRadarEnabled,
+    weatherRadarField,
   });
   propsRef.current = {
+    events,
     viewportMode,
     autoRotate,
     selectedEvent,
@@ -196,6 +232,9 @@ export function GlobeWebGLCanvas({
     seismicMetrics,
     windLayerEnabled,
     windField,
+    windCycloneEvents,
+    weatherRadarEnabled,
+    weatherRadarField,
   };
 
   const sceneHandleRef = useRef<{
@@ -238,10 +277,24 @@ export function GlobeWebGLCanvas({
       quakes: SeismicQuake24h[],
       metrics: SeismicHeatScaleMetrics | null
     ) => void;
-    syncWindLayer: (enabled: boolean, field: GlobalWindFieldResponse | null) => void;
+    syncWindLayer: (
+      enabled: boolean,
+      field: GlobalWindFieldResponse | null,
+      evs: GlobalEvent[]
+    ) => void;
+    syncWeatherRadarLayer: (
+      enabled: boolean,
+      radarField: GlobalWeatherRadarResponse | null,
+      windField: GlobalWindFieldResponse | null,
+      evs: GlobalEvent[]
+    ) => void;
     resetFlyAlong: () => void;
     prefetchTarget: (lat: number, lng: number, targetDist: number) => void;
     setReticleTarget: (lat: number, lng: number) => void;
+    syncTrafficCameraMarker: (
+      marker: { lat: number; lng: number; bearingDeg: number } | null
+    ) => void;
+    focusTrafficCamera: (lat: number, lng: number) => void;
     applyZoomAction: (action: 'in' | 'out' | 'street', fallbackLat: number, fallbackLng: number) => void;
     requestRender: () => void;
   } | null>(null);
@@ -306,11 +359,8 @@ export function GlobeWebGLCanvas({
     controls.rotateSpeed = 0.72;
     controls.zoomSpeed = 0.9;
 
-    const initialIsGodsEye = propsRef.current.textureMode === 'godseye';
-    scene.environmentIntensity = initialIsGodsEye ? 0.22 : 1.0;
-
     // 3-Point Studio / Orbital Lighting Rig
-    const keyLight = new THREE.DirectionalLight(0xfff4de, initialIsGodsEye ? 0.95 : 2.2);
+    const keyLight = new THREE.DirectionalLight(0xfff4de, 2.5);
     keyLight.position.set(42, 48, 34);
     if (!isSoftwareGl) {
       keyLight.castShadow = true;
@@ -324,15 +374,42 @@ export function GlobeWebGLCanvas({
     }
     scene.add(keyLight);
 
-    const hemiLight = new THREE.HemisphereLight(0x38bdf8, 0x0f172a, 1.05);
+    const hemiLight = new THREE.HemisphereLight(0x38bdf8, 0x0f172a, 0.45);
     scene.add(hemiLight);
 
-    const rimLight = new THREE.DirectionalLight(0x22d3ee, 0.85);
+    const rimLight = new THREE.DirectionalLight(0x22d3ee, 0.35);
     rimLight.position.set(-22, -10, -18);
     scene.add(rimLight);
 
+    const syncModeLighting = (texMode: GlobeTextureMode, vpMode: ViewportMode) => {
+      const isGodsEye = texMode === 'godseye';
+      const isSatellite = texMode === 'satellite';
+      if (vpMode === 'sector3d') {
+        scene.environmentIntensity = isGodsEye ? 0.36 : 0.95;
+        keyLight.intensity = isGodsEye ? 1.25 : 2.25;
+        hemiLight.intensity = 1.05;
+        rimLight.intensity = 0.85;
+      } else if (isSatellite) {
+        scene.environmentIntensity = 0.28;
+        keyLight.intensity = 2.65;
+        hemiLight.intensity = 0.42;
+        rimLight.intensity = 0.30;
+      } else if (isGodsEye) {
+        scene.environmentIntensity = 0.24;
+        keyLight.intensity = 1.05;
+        hemiLight.intensity = 0.72;
+        rimLight.intensity = 0.55;
+      } else {
+        scene.environmentIntensity = 0.38;
+        keyLight.intensity = 1.45;
+        hemiLight.intensity = 0.78;
+        rimLight.intensity = 0.52;
+      }
+    };
+    syncModeLighting(propsRef.current.textureMode, propsRef.current.viewportMode);
+
     // Spectral Starfield (cool O/B blue-white, crisp white, warm K/M amber)
-    const starCount = 950;
+    const starCount = 1400;
     const starPos = new Float32Array(starCount * 3);
     const starColors = new Float32Array(starCount * 3);
     for (let i = 0; i < starCount; i++) {
@@ -344,7 +421,8 @@ export function GlobeWebGLCanvas({
       starPos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
 
       const tintSeed = (i * 29) % 10;
-      const brightness = 0.65 + ((i * 17) % 11) * 0.032;
+      const isBrightStar = i % 19 === 0;
+      const brightness = isBrightStar ? 0.98 : 0.42 + ((i * 17) % 11) * 0.042;
       if (tintSeed < 3) {
         starColors[i * 3] = 0.72 * brightness;
         starColors[i * 3 + 1] = 0.86 * brightness;
@@ -378,10 +456,10 @@ export function GlobeWebGLCanvas({
     const starMat = new THREE.PointsMaterial({
       vertexColors: true,
       map: starSprite,
-      size: 0.42,
+      size: 0.46,
       sizeAttenuation: true,
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.90,
       depthWrite: false,
       alphaTest: 0.01,
     });
@@ -398,6 +476,7 @@ export function GlobeWebGLCanvas({
       horizonFadeRadius: { value: 0.0 },
       time: { value: 0.0 },
       focusPoint: { value: new THREE.Vector3(0, 0, 0) },
+      edgeColor: { value: new THREE.Color('#06090f') },
     };
 
     let scanAnimActive = false;
@@ -418,6 +497,24 @@ export function GlobeWebGLCanvas({
 
     const bootTexMode = propsRef.current.textureMode;
     const initialTex = createGlobeTextures(bootTexMode, maxAnisotropy, !isSoftwareGl);
+    const nightLightsTex = createNightLightsTexture(!isSoftwareGl);
+    nightLightsTex.anisotropy = maxAnisotropy;
+    const initialSolar = computeSubSolarPoint(Date.now());
+    const sunDir = new THREE.Vector3(
+      initialSolar.sunDir.x,
+      initialSolar.sunDir.y,
+      initialSolar.sunDir.z
+    ).normalize();
+    keyLight.position.copy(sunDir).multiplyScalar(64);
+
+    const solarUniforms: GlobeSolarUniforms = {
+      uSunDir: { value: sunDir.clone() },
+      uTerminatorEnabled: { value: bootTexMode === 'satellite' ? 1.0 : 0.0 },
+      uNightLightsMap: { value: nightLightsTex },
+      uNightLightsIntensity: { value: 1.35 },
+      uPlanetRoughnessMap: { value: initialTex.roughnessMap },
+    };
+
     const earthGeo = new THREE.SphereGeometry(
       GLOBE_RADIUS,
       isSoftwareGl ? 64 : 128,
@@ -426,22 +523,29 @@ export function GlobeWebGLCanvas({
     const earthMat = new THREE.MeshStandardMaterial({
       map: initialTex.colorMap,
       bumpMap: initialTex.bumpMap,
-      bumpScale: 0.04,
+      bumpScale: 0.055,
       roughnessMap: initialTex.roughnessMap,
-      roughness: 0.9,
-      metalness: 0.05,
-      envMapIntensity: 0.3,
+      roughness: 0.92,
+      metalness: 0.04,
+      envMapIntensity: 0.25,
     });
+    applyGlobeTerminatorShader(earthMat, solarUniforms);
     const earthMesh = new THREE.Mesh(earthGeo, earthMat);
     globeRoot.add(earthMesh);
+
+    let realPlanetDemTextures: {
+      bumpMap: THREE.CanvasTexture;
+      roughnessMap: THREE.CanvasTexture;
+    } | null = null;
 
     let disposed = false;
     let swRenderBusy = false;
     let swDirty = true;
     let swTimerId = 0;
+    let isContextLost = false;
     let loopPaused = document.visibilityState === 'hidden';
     function requestRenderIfNeeded() {
-      if (!isSoftwareGl || disposed || loopPaused) return;
+      if (!isSoftwareGl || disposed || loopPaused || isContextLost) return;
       swDirty = true;
       if (swRenderBusy || swTimerId !== 0) return;
       swTimerId = window.setTimeout(() => {
@@ -458,6 +562,15 @@ export function GlobeWebGLCanvas({
     if (propsRef.current.windField) {
       globeWindLayer.setData(propsRef.current.windField);
     }
+    globeWindLayer.setCyclones(propsRef.current.windCycloneEvents ?? propsRef.current.events);
+
+    const globeWeatherRadarLayer = new GlobeWeatherRadarLayer(GLOBE_RADIUS, isSoftwareGl);
+    globeWeatherRadarLayer.setEnabled(propsRef.current.weatherRadarEnabled);
+    globeWeatherRadarLayer.setData(
+      propsRef.current.weatherRadarField,
+      propsRef.current.windField,
+      propsRef.current.windCycloneEvents ?? propsRef.current.events
+    );
 
     const cloudTex = createCloudTexture(!isSoftwareGl);
     const cloudGeo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.016, 48, 36);
@@ -468,20 +581,22 @@ export function GlobeWebGLCanvas({
       depthWrite: false,
       roughness: 1,
     });
+    applyCloudTerminatorShader(cloudMat, solarUniforms);
     const cloudMesh = new THREE.Mesh(cloudGeo, cloudMat);
     cloudMesh.visible = bootTexMode === 'satellite';
     cloudMesh.renderOrder = 8;
     globeRoot.add(cloudMesh);
 
-    const sunDir = keyLight.position.clone().normalize();
     const atmoGeo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.045, 48, 36);
     const atmoMat = createAtmosphereMaterial(sunDir);
+    atmoMat.uniforms.terminatorStrength.value = bootTexMode === 'satellite' ? 1.0 : 0.25;
     const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
     atmoMesh.renderOrder = 10;
     globeRoot.add(atmoMesh);
 
     const haloGeo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.095, 48, 36);
     const haloMat = createOuterHaloMaterial(sunDir);
+    haloMat.uniforms.terminatorStrength.value = bootTexMode === 'satellite' ? 1.0 : 0.25;
     const haloMesh = new THREE.Mesh(haloGeo, haloMat);
     haloMesh.renderOrder = 11;
     globeRoot.add(haloMesh);
@@ -502,13 +617,19 @@ export function GlobeWebGLCanvas({
     }
     globeRoot.add(globeReticle.group);
 
-    const regionalTiles = new GlobeRegionalTileManager(GLOBE_RADIUS, maxAnisotropy, () => {
-      requestRenderIfNeeded();
-    });
+    const regionalTiles = new GlobeRegionalTileManager(
+      GLOBE_RADIUS,
+      maxAnisotropy,
+      () => {
+        requestRenderIfNeeded();
+      },
+      solarUniforms
+    );
     regionalTiles.setMode(bootTexMode);
     globeRoot.add(regionalTiles.group);
 
     globeRoot.add(globeSeismicLayer.group);
+    globeRoot.add(globeWeatherRadarLayer.group);
     globeRoot.add(globeWindLayer.group);
 
     const markersGroup = new THREE.Group();
@@ -532,6 +653,9 @@ export function GlobeWebGLCanvas({
     const sectorContainer = new THREE.Group();
     sectorContainer.visible = false;
     scene.add(sectorContainer);
+
+    const terrainSkyDome = new TerrainSkyDome(bootTexMode, sunDir);
+    sectorContainer.add(terrainSkyDome.mesh);
 
     const terrainSeismicLayer = new TerrainSeismicHeatmapLayer();
     sectorContainer.add(terrainSeismicLayer.group);
@@ -588,6 +712,31 @@ export function GlobeWebGLCanvas({
 
     // Stream real-world planetary imagery immediately on startup
     startPlanetaryStream(bootTexMode, initialTex.colorMap);
+
+    // Upgrade globe relief bumpMap & ocean/land roughnessMap with real global Terrarium DEM data
+    void fetch('/api/terrain/planet-dem')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((dem) => {
+        if (disposed || !dem || !Array.isArray(dem.heights01) || !dem.width || !dem.height) return;
+        const nextDem = buildPlanetaryDemTextures(dem, maxAnisotropy, !isSoftwareGl);
+        if (disposed) {
+          disposeCanvasTexture(nextDem.bumpMap);
+          disposeCanvasTexture(nextDem.roughnessMap);
+          return;
+        }
+        const prevBump = earthMat.bumpMap;
+        const prevRough = earthMat.roughnessMap;
+        realPlanetDemTextures = nextDem;
+        earthMat.bumpMap = nextDem.bumpMap;
+        earthMat.roughnessMap = nextDem.roughnessMap;
+        solarUniforms.uPlanetRoughnessMap.value = nextDem.roughnessMap;
+        earthMat.bumpScale = activeTexMode === 'satellite' ? 0.085 : 0.055;
+        earthMat.needsUpdate = true;
+        if (prevBump && prevBump !== nextDem.bumpMap) disposeCanvasTexture(prevBump);
+        if (prevRough && prevRough !== nextDem.roughnessMap) disposeCanvasTexture(prevRough);
+        requestRenderIfNeeded();
+      })
+      .catch(() => {});
 
     const sharedHitGeo = new THREE.SphereGeometry(0.28, 10, 10);
     const sharedHitMat = new THREE.MeshBasicMaterial({ visible: false });
@@ -675,6 +824,16 @@ export function GlobeWebGLCanvas({
       }
     };
 
+    const disposeCanvasTexture = (tex: THREE.Texture | null | undefined) => {
+      if (!tex) return;
+      tex.dispose();
+      const img = tex.image as HTMLCanvasElement | undefined;
+      if (img && typeof HTMLCanvasElement !== 'undefined' && img instanceof HTMLCanvasElement) {
+        img.width = 0;
+        img.height = 0;
+      }
+    };
+
     let cloudModeEnabled = bootTexMode === 'satellite';
     let activeTexMode: GlobeTextureMode = bootTexMode;
     let terrainStream: GlobalTerrainStreamManager | null = null;
@@ -689,28 +848,45 @@ export function GlobeWebGLCanvas({
       const prevRough = earthMat.roughnessMap;
       const next = createGlobeTextures(mode, maxAnisotropy, !isSoftwareGl);
       earthMat.map = next.colorMap;
-      earthMat.bumpMap = next.bumpMap;
-      earthMat.roughnessMap = next.roughnessMap;
+      if (realPlanetDemTextures) {
+        earthMat.bumpMap = realPlanetDemTextures.bumpMap;
+        earthMat.roughnessMap = realPlanetDemTextures.roughnessMap;
+        solarUniforms.uPlanetRoughnessMap.value = realPlanetDemTextures.roughnessMap;
+        earthMat.bumpScale = mode === 'satellite' ? 0.085 : 0.055;
+        disposeCanvasTexture(next.bumpMap);
+        disposeCanvasTexture(next.roughnessMap);
+      } else {
+        earthMat.bumpMap = next.bumpMap;
+        earthMat.roughnessMap = next.roughnessMap;
+        solarUniforms.uPlanetRoughnessMap.value = next.roughnessMap;
+        earthMat.bumpScale = 0.055;
+      }
       earthMat.needsUpdate = true;
-      prevMap?.dispose();
-      prevBump?.dispose();
-      prevRough?.dispose();
+      disposeCanvasTexture(prevMap);
+      if (prevBump && prevBump !== realPlanetDemTextures?.bumpMap) disposeCanvasTexture(prevBump);
+      if (prevRough && prevRough !== realPlanetDemTextures?.roughnessMap) disposeCanvasTexture(prevRough);
 
       regionalTiles.setMode(mode);
       startPlanetaryStream(mode, next.colorMap);
       terrainStream?.setTextureMode(mode);
 
-      const isGodsEye = mode === 'godseye';
-      scene.environmentIntensity = isGodsEye ? 0.36 : 1.0;
-      keyLight.intensity = isGodsEye ? 1.25 : 2.2;
+      const isSatellite = mode === 'satellite';
+      syncModeLighting(mode, propsRef.current.viewportMode);
+      solarUniforms.uTerminatorEnabled.value = isSatellite ? 1.0 : 0.0;
 
       const glowHex = mode === 'thermal' ? '#f59e0b' : mode === 'topo' ? '#38bdf8' : '#22d3ee';
       atmoMat.uniforms.glowColor.value.set(glowHex);
       haloMat.uniforms.glowColor.value.set(glowHex);
-      cloudModeEnabled = mode === 'satellite';
+      atmoMat.uniforms.terminatorStrength.value = isSatellite ? 1.0 : 0.25;
+      haloMat.uniforms.terminatorStrength.value = isSatellite ? 1.0 : 0.25;
+      cloudModeEnabled = isSatellite;
       cloudMesh.visible = cloudModeEnabled;
 
+      terrainSkyDome.setMode(mode);
       if (propsRef.current.viewportMode === 'sector3d') {
+        const pal = getTerrainAtmospherePalette(mode);
+        scene.fog = new THREE.FogExp2(pal.fogHex, pal.fogDensity);
+        godsEyeUniforms.edgeColor?.value.set(pal.horizonHex);
         triggerScanSweep(controls.target.x, controls.target.y, controls.target.z, 210);
       } else {
         triggerScanSweep(
@@ -856,6 +1032,21 @@ export function GlobeWebGLCanvas({
     let preserveSectorCameraOffset = false;
     let lastPanStreamMs = 0;
 
+    const syncTerrainSeismicMarkers = () => {
+      if (!terrainStream) return;
+      if (!propsRef.current.seismicMetrics) {
+        terrainSeismicLayer.group.visible = false;
+        return;
+      }
+      terrainSeismicLayer.syncLocalQuakes(
+        propsRef.current.seismicQuakes24h,
+        propsRef.current.seismicMetrics,
+        propsRef.current.seismicHeatmapEnabled,
+        (lat, lng) => terrainStream!.latLngToWorldXZ(lat, lng),
+        (x, z) => terrainStream!.sampleHeightAtWorldXZ(x, z)
+      );
+    };
+
     const rebuildSector = (preset: SectorPreset, route: PredictiveRouteResult | null) => {
       if (!terrainStream) {
         anchorCoord = { lat: preset.lat, lng: preset.lng };
@@ -881,15 +1072,7 @@ export function GlobeWebGLCanvas({
               flyState.camPos.set(worldCenter.x + 30, worldCenter.y + 22, worldCenter.z + 32);
             }
             preserveSectorCameraOffset = false;
-            if (terrainStream && propsRef.current.seismicMetrics) {
-              terrainSeismicLayer.syncLocalQuakes(
-                propsRef.current.seismicQuakes24h,
-                propsRef.current.seismicMetrics,
-                propsRef.current.seismicHeatmapEnabled,
-                (lat, lng) => terrainStream!.latLngToWorldXZ(lat, lng),
-                (x, z) => terrainStream!.sampleHeightAtWorldXZ(x, z)
-              );
-            }
+            syncTerrainSeismicMarkers();
             triggerScanSweep(worldCenter.x, worldCenter.y, worldCenter.z, 210);
             requestRenderIfNeeded();
           },
@@ -911,6 +1094,7 @@ export function GlobeWebGLCanvas({
         anchorCoord = { lat: preset.lat, lng: preset.lng };
         preserveSectorCameraOffset = false;
         terrainStream.setAnchor(preset.lat, preset.lng);
+        syncTerrainSeismicMarkers();
       } else if (jumpKm > 0.08) {
         // Continuous regional move within 45 km: keep streamed world intact & glide camera smoothly
         const [wx, wz] = terrainStream.latLngToWorldXZ(preset.lat, preset.lng);
@@ -927,6 +1111,7 @@ export function GlobeWebGLCanvas({
           flyState.camPos.set(wx + _vec3.x, wy + Math.max(12, _vec3.y), wz + _vec3.z);
         }
         preserveSectorCameraOffset = false;
+        syncTerrainSeismicMarkers();
         triggerScanSweep(wx, wy, wz, 210);
       }
     };
@@ -936,13 +1121,17 @@ export function GlobeWebGLCanvas({
       globeRoot.visible = !isSector;
       stars.visible = !isSector;
       sectorContainer.visible = isSector;
+      syncModeLighting(activeTexMode, mode);
 
       if (isSector) {
-        godsEyeUniforms.horizonFadeRadius.value = 560.0;
+        const pal = getTerrainAtmospherePalette(activeTexMode);
+        terrainSkyDome.setMode(activeTexMode);
+        godsEyeUniforms.horizonFadeRadius.value = 420.0;
+        godsEyeUniforms.edgeColor?.value.set(pal.horizonHex);
         camera.near = 0.08;
         camera.far = 1100;
         camera.updateProjectionMatrix();
-        scene.fog = new THREE.FogExp2('#06090f', 0.0014);
+        scene.fog = new THREE.FogExp2(pal.fogHex, pal.fogDensity);
         controls.enablePan = true;
         controls.minDistance = 1.6;
         controls.maxDistance = 280;
@@ -959,9 +1148,11 @@ export function GlobeWebGLCanvas({
           triggerScanSweep(wx, wy, wz, 260);
         }
       } else {
+        terrainStream?.trimMemory();
         godsEyeUniforms.horizonFadeRadius.value = 0.0;
+        godsEyeUniforms.edgeColor?.value.set('#06090f');
         preserveSectorCameraOffset = false;
-        keyLight.position.set(42, 48, 34);
+        keyLight.position.copy(solarUniforms.uSunDir.value).multiplyScalar(64);
         keyLight.target.position.set(0, 0, 0);
         keyLight.target.updateMatrixWorld();
         camera.near = 0.25;
@@ -1014,6 +1205,8 @@ export function GlobeWebGLCanvas({
       setTextureMode,
       setVerticalExaggeration: (exag) => {
         terrainStream?.setVerticalExaggeration(exag);
+        syncTerrainSeismicMarkers();
+        requestRenderIfNeeded();
       },
       setQualityPreference: (pref) => {
         if (pref === 'auto') {
@@ -1044,11 +1237,17 @@ export function GlobeWebGLCanvas({
         }
         requestRenderIfNeeded();
       },
-      syncWindLayer: (enabled, field) => {
+      syncWindLayer: (enabled, field, evs) => {
         globeWindLayer.setEnabled(enabled);
         if (field) {
           globeWindLayer.setData(field);
         }
+        globeWindLayer.setCyclones(evs);
+        requestRenderIfNeeded();
+      },
+      syncWeatherRadarLayer: (enabled, rField, wField, evs) => {
+        globeWeatherRadarLayer.setEnabled(enabled);
+        globeWeatherRadarLayer.setData(rField, wField, evs);
         requestRenderIfNeeded();
       },
       resetFlyAlong: () => {
@@ -1060,6 +1259,23 @@ export function GlobeWebGLCanvas({
       },
       setReticleTarget: (lat, lng) => {
         positionGlobeReticle(lat, lng);
+      },
+      syncTrafficCameraMarker: (marker) => {
+        terrainStream?.setTrafficCameraMarker(marker);
+        requestRenderIfNeeded();
+      },
+      focusTrafficCamera: (lat, lng) => {
+        if (!terrainStream) return;
+        const [wx, wz] = terrainStream.latLngToWorldXZ(lat, lng);
+        const wy = terrainStream.sampleHeightAtWorldXZ(wx, wz);
+        flyState.isSector = true;
+        flyState.lookAt.set(wx, wy + 1.0, wz);
+        flyState.camPos.set(wx + 9.5, wy + 5.6, wz + 9.5);
+        flyState.active = true;
+        terrainStream.updateFocusLatLng(lat, lng);
+        triggerScanSweep(wx, wy, wz, 95);
+        preserveSectorCameraOffset = true;
+        requestRenderIfNeeded();
       },
       requestRender: requestRenderIfNeeded,
       applyZoomAction: (action, fallbackLat, fallbackLng) => {
@@ -1226,7 +1442,26 @@ export function GlobeWebGLCanvas({
           if (quake) {
             callbacksRef.current.onSelectQuake24h?.(quake);
             requestRenderIfNeeded();
+            return;
           }
+        }
+        const roadHit = terrainStream.pickRoadAtRay(raycaster);
+        if (roadHit) {
+          const camFeed = buildTrafficCameraFeedPoint({
+            road: roadHit.road,
+            lat: roadHit.lat,
+            lng: roadHit.lng,
+            elevationM: roadHit.elevationM,
+            bearingDeg: roadHit.bearingDeg,
+            events: propsRef.current.events,
+          });
+          terrainStream.setTrafficCameraMarker({
+            lat: camFeed.lat,
+            lng: camFeed.lng,
+            bearingDeg: camFeed.bearingDeg,
+          });
+          callbacksRef.current.onSelectTrafficCamera?.(camFeed);
+          requestRenderIfNeeded();
         }
         return;
       }
@@ -1332,10 +1567,30 @@ export function GlobeWebGLCanvas({
 
     const onContextLost = (e: Event) => {
       e.preventDefault();
+      isContextLost = true;
+      loopPaused = true;
+      swRenderBusy = false;
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
+      clearTimeout(swTimerId);
+      swTimerId = 0;
       setContextLost(true);
     };
     const onContextRestored = () => {
+      isContextLost = false;
+      loopPaused = document.visibilityState === 'hidden';
       setContextLost(false);
+      if (terrainStream) {
+        terrainStream.setAnchor(anchorCoord.lat, anchorCoord.lng);
+      }
+      if (!loopPaused && !disposed) {
+        prevTime = performance.now();
+        if (isSoftwareGl) {
+          requestRenderIfNeeded();
+        } else {
+          tick();
+        }
+      }
     };
     renderer.domElement.addEventListener('webglcontextlost', onContextLost);
     renderer.domElement.addEventListener('webglcontextrestored', onContextRestored);
@@ -1361,16 +1616,27 @@ export function GlobeWebGLCanvas({
     let lastAltEmitMs = 0;
 
     function afterDraw(cb: () => void) {
+      if (disposed || isContextLost) return;
       const gl = renderer.getContext() as WebGL2RenderingContext;
+      if (!gl || (typeof gl.isContextLost === 'function' && gl.isContextLost())) {
+        return;
+      }
       const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (!sync) {
+        frameId = window.setTimeout(cb, 80);
+        return;
+      }
       gl.flush();
       const poll = () => {
-        if (disposed) return;
-        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+        if (disposed || isContextLost) {
+          gl.deleteSync(sync);
+          return;
+        }
+        const state = gl.getSyncParameter(sync, gl.SYNC_STATUS);
         if (state === gl.UNSIGNALED) {
           frameId = window.setTimeout(poll, 5);
         } else {
-          if (sync) gl.deleteSync(sync);
+          gl.deleteSync(sync);
           frameId = window.setTimeout(cb, 80);
         }
       };
@@ -1379,8 +1645,8 @@ export function GlobeWebGLCanvas({
 
     const onVisibilityChange = () => {
       const hidden = document.visibilityState === 'hidden';
-      loopPaused = hidden;
-      if (!hidden && !disposed) {
+      loopPaused = hidden || isContextLost;
+      if (!loopPaused && !disposed) {
         prevTime = performance.now();
         cancelAnimationFrame(frameId);
         clearTimeout(frameId);
@@ -1397,9 +1663,10 @@ export function GlobeWebGLCanvas({
 
     let smoothedFrameMs = 16.6;
     let lastQualityEvalMs = startTime;
+    let lastSolarSyncMs = startTime;
 
     function tick() {
-      if (disposed || loopPaused) return;
+      if (disposed || loopPaused || isContextLost) return;
       if (isSoftwareGl) {
         swRenderBusy = true;
         swDirty = false;
@@ -1410,6 +1677,14 @@ export function GlobeWebGLCanvas({
       const elapsed = (now - startTime) / 1000;
       prevTime = now;
       godsEyeUniforms.time.value = elapsed;
+
+      if (now - lastSolarSyncMs > 4000) {
+        lastSolarSyncMs = now;
+        const solar = computeSubSolarPoint(Date.now());
+        solarUniforms.uSunDir.value.set(solar.sunDir.x, solar.sunDir.y, solar.sunDir.z);
+        atmoMat.uniforms.sunDir.value.copy(solarUniforms.uSunDir.value);
+        haloMat.uniforms.sunDir.value.copy(solarUniforms.uSunDir.value);
+      }
 
       if (!isSoftwareGl && rawFrameMs > 2 && rawFrameMs < 160 && propsRef.current.qualityPreference === 'auto') {
         smoothedFrameMs = smoothedFrameMs * 0.92 + rawFrameMs * 0.08;
@@ -1438,6 +1713,7 @@ export function GlobeWebGLCanvas({
       cloudMesh.rotation.y += delta * 0.01;
 
       if (propsRef.current.viewportMode === 'globe') {
+        keyLight.position.copy(solarUniforms.uSunDir.value).multiplyScalar(64);
         const camDist = camera.position.length();
         const altitude = Math.max(0.00008, camDist - GLOBE_RADIUS);
 
@@ -1459,6 +1735,7 @@ export function GlobeWebGLCanvas({
 
         orbitalConstellation.update(elapsed, altitude, activeTexMode === 'godseye');
         globeSeismicLayer.update(elapsed, altitude);
+        globeWeatherRadarLayer.update(altitude, elapsed);
         _vec3.copy(camera.position).normalize();
         globeWindLayer.update(delta, altitude, _vec3.x, _vec3.y, _vec3.z);
         globeReticle.group.visible = altitude > 0.006;
@@ -1544,6 +1821,7 @@ export function GlobeWebGLCanvas({
           }
           const ty = terrainStream.sampleHeightAtWorldXZ(controls.target.x, controls.target.z);
           godsEyeUniforms.focusPoint.value.set(controls.target.x, ty, controls.target.z);
+          terrainSkyDome.updatePosition(controls.target.x, 0, controls.target.z);
           keyLight.position.set(controls.target.x + 42, ty + 54, controls.target.z + 34);
           keyLight.target.position.set(controls.target.x, ty, controls.target.z);
           keyLight.target.updateMatrixWorld();
@@ -1671,8 +1949,10 @@ export function GlobeWebGLCanvas({
       controls.dispose();
       regionalTiles.dispose();
       globeSeismicLayer.dispose();
+      globeWeatherRadarLayer.dispose();
       globeWindLayer.dispose();
       terrainSeismicLayer.dispose();
+      terrainSkyDome.dispose();
       orbitalConstellation.dispose();
       globeReticle.dispose();
       sectorReticle.dispose();
@@ -1684,19 +1964,29 @@ export function GlobeWebGLCanvas({
       navMarkerGeo.dispose();
       navMarkerMat.dispose();
       earthGeo.dispose();
-      earthMat.map?.dispose();
-      earthMat.bumpMap?.dispose();
-      earthMat.roughnessMap?.dispose();
+      disposeCanvasTexture(earthMat.map);
+      disposeCanvasTexture(earthMat.bumpMap);
+      disposeCanvasTexture(earthMat.roughnessMap);
+      if (realPlanetDemTextures) {
+        if (earthMat.bumpMap !== realPlanetDemTextures.bumpMap) {
+          disposeCanvasTexture(realPlanetDemTextures.bumpMap);
+        }
+        if (earthMat.roughnessMap !== realPlanetDemTextures.roughnessMap) {
+          disposeCanvasTexture(realPlanetDemTextures.roughnessMap);
+        }
+        realPlanetDemTextures = null;
+      }
+      disposeCanvasTexture(nightLightsTex);
       earthMat.dispose();
       cloudGeo.dispose();
-      cloudTex.dispose();
+      disposeCanvasTexture(cloudTex);
       cloudMat.dispose();
       atmoGeo.dispose();
       atmoMat.dispose();
       haloGeo.dispose();
       haloMat.dispose();
       starGeo.dispose();
-      starSprite.dispose();
+      disposeCanvasTexture(starSprite);
       starMat.dispose();
       envTarget.dispose();
       renderer.dispose();
@@ -1729,8 +2019,18 @@ export function GlobeWebGLCanvas({
   }, [events, selectedEvent?.id, seismicHeatmapEnabled, seismicQuakes24h, seismicMetrics]);
 
   useEffect(() => {
-    sceneHandleRef.current?.syncWindLayer(windLayerEnabled, windField);
-  }, [windLayerEnabled, windField]);
+    sceneHandleRef.current?.syncWindLayer(
+      windLayerEnabled,
+      windField,
+      windCycloneEvents ?? events
+    );
+    sceneHandleRef.current?.syncWeatherRadarLayer(
+      weatherRadarEnabled,
+      weatherRadarField,
+      windField,
+      windCycloneEvents ?? events
+    );
+  }, [windLayerEnabled, windField, weatherRadarEnabled, weatherRadarField, windCycloneEvents, events]);
 
   useEffect(() => {
     sceneHandleRef.current?.rebuildRouteArc(activeRoute);
@@ -1785,6 +2085,25 @@ export function GlobeWebGLCanvas({
     if (!handle || !zoomSignal || viewportMode === 'maps') return;
     handle.applyZoomAction(zoomSignal.action, activeSector.lat, activeSector.lng);
   }, [zoomSignal, viewportMode, activeSector.lat, activeSector.lng]);
+
+  useEffect(() => {
+    const handle = sceneHandleRef.current;
+    if (!handle || viewportMode !== 'sector3d') return;
+    if (!trafficCameraPoint) {
+      handle.syncTrafficCameraMarker(null);
+      return;
+    }
+    handle.syncTrafficCameraMarker(trafficCameraPoint);
+    if (trafficCameraPoint.focusNonce) {
+      handle.focusTrafficCamera(trafficCameraPoint.lat, trafficCameraPoint.lng);
+    }
+  }, [
+    trafficCameraPoint?.lat,
+    trafficCameraPoint?.lng,
+    trafficCameraPoint?.bearingDeg,
+    trafficCameraPoint?.focusNonce,
+    viewportMode,
+  ]);
 
   return (
     <div className="relative w-full h-full bg-[#06090f] overflow-hidden">

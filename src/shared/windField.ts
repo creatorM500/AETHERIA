@@ -1,12 +1,18 @@
-import { clamp } from './geo.ts';
+import { clamp, latLngToCartesian } from './geo.ts';
 import type {
+  CycloneVortexSpec,
+  GlobalEvent,
   GlobalWindFieldResponse,
   WindFieldMetrics,
   WindPeakPoint,
 } from './types.ts';
 
+export const EARTH_RADIUS_KM = 6371;
 const DEG_TO_RAD = Math.PI / 180;
 const RAD_TO_DEG = 180 / Math.PI;
+
+const CYCLONE_TITLE_RE =
+  /cicl[oó]n|cyclone|hurricane|hurac[aá]n|typhoon|tif[oó]n|tropical\s+(storm|depression|cyclone)|tormenta\s+tropical/i;
 
 /**
  * Converts meteorological wind (speed in m/s and direction FROM in degrees clockwise from North)
@@ -309,3 +315,436 @@ export function buildAtmosphericBaselineWindField(nowMs = Date.now()): GlobalWin
     updatedAt: new Date(nowMs).toISOString(),
   };
 }
+
+export interface PreparedCycloneVortex extends CycloneVortexSpec {
+  cx: number;
+  cy: number;
+  cz: number;
+  cosMaxAngle: number;
+  outerAngleRad: number;
+  nominalAngleRad: number;
+}
+
+export interface CycloneSampleResult {
+  vx: number;
+  vy: number;
+  vz: number;
+  blendWeight: number;
+  speedMs: number;
+  vorticityScale: number;
+  spiralCurvature: number;
+}
+
+/**
+ * Classifies Saffir-Simpson cyclone category (0 = Tropical Storm/Depression, 1..5 = Hurricane/Typhoon Cat 1-5)
+ * using explicit category, title/summary text hints, or sustained wind speed (km/h).
+ */
+export function classifyCycloneCategory(
+  maxWindKmh: number,
+  explicitCategory?: number,
+  textHint?: string
+): 0 | 1 | 2 | 3 | 4 | 5 {
+  if (typeof explicitCategory === 'number' && Number.isFinite(explicitCategory)) {
+    const rounded = Math.round(clamp(explicitCategory, 0, 5));
+    return rounded as 0 | 1 | 2 | 3 | 4 | 5;
+  }
+
+  if (textHint) {
+    const m = textHint.match(/\b(?:cat(?:egor[yía]+)?\.?\s*)([1-5])\b/i);
+    if (m) {
+      return Number(m[1]) as 1 | 2 | 3 | 4 | 5;
+    }
+  }
+
+  const safeKmh = Number.isFinite(maxWindKmh) ? Math.max(0, maxWindKmh) : 0;
+  if (safeKmh >= 252) return 5;
+  if (safeKmh >= 209) return 4;
+  if (safeKmh >= 178) return 3;
+  if (safeKmh >= 154) return 2;
+  if (safeKmh >= 119) return 1;
+  return 0;
+}
+
+/**
+ * Estimates central barometric pressure (hPa) from explicit pressure, text hints (hPa/mb),
+ * or the Atkinson-Holliday (1977) tropical cyclone pressure-wind relation.
+ */
+export function estimateCentralPressureHpa(
+  maxWindKmh: number,
+  explicitPressureHpa?: number,
+  textHint?: string
+): number {
+  if (
+    typeof explicitPressureHpa === 'number' &&
+    Number.isFinite(explicitPressureHpa) &&
+    explicitPressureHpa >= 850 &&
+    explicitPressureHpa <= 1030
+  ) {
+    return Math.round(clamp(explicitPressureHpa, 870, 1015));
+  }
+
+  if (textHint) {
+    const m = textHint.match(/\b(\d{3,4})\s*(?:hpa|mb)\b/i);
+    if (m) {
+      const parsed = Number(m[1]);
+      if (Number.isFinite(parsed) && parsed >= 850 && parsed <= 1020) {
+        return Math.round(clamp(parsed, 870, 1015));
+      }
+    }
+  }
+
+  const safeKmh = Number.isFinite(maxWindKmh) ? Math.max(35, maxWindKmh) : 65;
+  const windKts = clamp(safeKmh / 1.852, 20, 190);
+  const estimated = 1010 - Math.pow(windKts / 6.7, 1 / 0.644);
+  return Math.round(clamp(estimated, 870, 1012));
+}
+
+/**
+ * Computes a dynamic vorticity (rotational spin) scalar from central barometric pressure deficit,
+ * Saffir-Simpson category, and physical radius compactness.
+ */
+export function computeCycloneVorticityScale(
+  centralPressureHpa: number,
+  cycloneCategory: 0 | 1 | 2 | 3 | 4 | 5,
+  radiusKm: number
+): number {
+  const safePressure = Number.isFinite(centralPressureHpa)
+    ? clamp(centralPressureHpa, 870, 1015)
+    : 998;
+  const pressureDeficit = clamp((1013 - safePressure) / 55, 0.12, 2.15);
+  const categoryFactor = 0.85 + clamp(cycloneCategory, 0, 5) * 0.22;
+  const radiusCompactness = clamp(260 / Math.max(140, radiusKm), 0.72, 1.35);
+
+  const rawScale =
+    (0.46 + pressureDeficit * 0.58) *
+    (0.68 + categoryFactor * 0.34) *
+    radiusCompactness;
+
+  return Number(clamp(rawScale, 0.55, 2.85).toFixed(3));
+}
+
+/**
+ * Extracts active tropical cyclones / severe atmospheric vortices from live events,
+ * preserving their physical radiusKm, sustained wind intensity, central pressure, category, and vorticity scale.
+ */
+export function extractCycloneVorticesFromEvents(
+  events: readonly GlobalEvent[]
+): CycloneVortexSpec[] {
+  const out: CycloneVortexSpec[] = [];
+  for (const ev of events) {
+    if (ev.category !== 'disaster') continue;
+    const isStormSubtype = ev.subtype === 'storm';
+    const textHint = `${ev.title} ${ev.summary}`;
+    const isCycloneTitle = CYCLONE_TITLE_RE.test(ev.title) || CYCLONE_TITLE_RE.test(ev.summary);
+    if (!isStormSubtype && !isCycloneTitle) continue;
+    if (!Number.isFinite(ev.lat) || !Number.isFinite(ev.lng)) continue;
+
+    // Parse sustained wind from explicit maxWindKmh, speedKts, or summary/title text
+    let windKmh = typeof ev.maxWindKmh === 'number' && ev.maxWindKmh > 0 ? ev.maxWindKmh : 0;
+    if (windKmh <= 0 && typeof ev.speedKts === 'number' && ev.speedKts >= 25) {
+      windKmh = ev.speedKts * 1.852;
+    }
+    if (windKmh <= 0) {
+      const m = textHint.match(/(\d+(?:\.\d+)?)\s*(km\/h|kmh|nudos|knots|kts|kt)/i);
+      if (m) {
+        const val = Number(m[1]);
+        const unit = m[2].toLowerCase();
+        if (Number.isFinite(val) && val > 0) {
+          windKmh = unit.includes('km') ? val : val * 1.852;
+        }
+      }
+    }
+    if (windKmh <= 0) {
+      windKmh = ev.severity === 'critical' ? 185 : ev.severity === 'high' ? 115 : 74;
+    }
+
+    const maxWindMs = clamp(windKmh / 3.6, 17.5, 85.0);
+    const effectiveWindKmh = maxWindMs * 3.6;
+
+    const rawPressure =
+      typeof ev.centralPressureHpa === 'number'
+        ? ev.centralPressureHpa
+        : typeof ev.rawDetails?.pressureHpa === 'number'
+          ? ev.rawDetails.pressureHpa
+          : typeof ev.rawDetails?.centralPressure === 'number'
+            ? ev.rawDetails.centralPressure
+            : undefined;
+
+    const cycloneCategory = classifyCycloneCategory(
+      effectiveWindKmh,
+      ev.cycloneCategory,
+      textHint
+    );
+    const centralPressureHpa = estimateCentralPressureHpa(
+      effectiveWindKmh,
+      rawPressure,
+      textHint
+    );
+
+    const radiusKm = clamp(
+      typeof ev.radiusKm === 'number' && ev.radiusKm > 0
+        ? ev.radiusKm
+        : 185 + effectiveWindKmh * 1.15,
+      160,
+      620
+    );
+    const coreRatio = clamp(0.24 - cycloneCategory * 0.014, 0.15, 0.24);
+    const coreRadiusKm = clamp(radiusKm * coreRatio, 24, 78);
+    const outerInfluenceKm = radiusKm * 1.55;
+    const vorticityScale = computeCycloneVorticityScale(
+      centralPressureHpa,
+      cycloneCategory,
+      radiusKm
+    );
+    // Coriolis rotation: CCW (+1) in Northern Hemisphere, CW (-1) in Southern Hemisphere
+    const spinSign: 1 | -1 = ev.lat >= 0 ? 1 : -1;
+
+    out.push({
+      id: ev.id,
+      title: ev.title,
+      lat: ev.lat,
+      lng: ev.lng,
+      radiusKm,
+      coreRadiusKm,
+      outerInfluenceKm,
+      maxWindMs,
+      centralPressureHpa,
+      cycloneCategory,
+      vorticityScale,
+      spinSign,
+    });
+  }
+  return out;
+}
+
+export function prepareCycloneVortices(
+  vortices: readonly CycloneVortexSpec[]
+): PreparedCycloneVortex[] {
+  return vortices.map((v) => {
+    const c = latLngToCartesian(v.lat, v.lng, 1);
+    const outerAngleRad = v.outerInfluenceKm / EARTH_RADIUS_KM;
+    const nominalAngleRad = v.radiusKm / EARTH_RADIUS_KM;
+    return {
+      ...v,
+      cx: c.x,
+      cy: c.y,
+      cz: c.z,
+      cosMaxAngle: Math.cos(Math.min(Math.PI, outerAngleRad * 1.02)),
+      outerAngleRad,
+      nominalAngleRad,
+    };
+  });
+}
+
+/**
+ * Evaluates modified Rankine tangential wind + dynamic vorticity scaling + radius-adjusted
+ * boundary-layer spiral convergence in 3D unit-sphere tangent coordinates at surface normal (px, py, pz).
+ * Returns false if outside the cyclone's outer influence radius.
+ */
+export function samplePreparedCycloneAtNormal(
+  vortex: PreparedCycloneVortex,
+  px: number,
+  py: number,
+  pz: number,
+  out: CycloneSampleResult
+): boolean {
+  const dot = clamp(px * vortex.cx + py * vortex.cy + pz * vortex.cz, -1, 1);
+  if (dot < vortex.cosMaxAngle) {
+    return false;
+  }
+
+  // Chord-based great-circle angle stays accurate even very close to the eye (alpha -> 0)
+  const dx = px - vortex.cx;
+  const dy = py - vortex.cy;
+  const dz = pz - vortex.cz;
+  const halfChord = Math.min(1, Math.hypot(dx, dy, dz) * 0.5);
+  const angleRad = 2 * Math.asin(halfChord);
+  const dKm = angleRad * EARTH_RADIUS_KM;
+
+  if (dKm >= vortex.outerInfluenceKm) {
+    return false;
+  }
+
+  // Outward tangent vector at P pointing directly away from cyclone eye C:
+  // r_out = -C + (C · P) * P  (strictly orthogonal to P)
+  let rx = -vortex.cx + dot * px;
+  let ry = -vortex.cy + dot * py;
+  let rz = -vortex.cz + dot * pz;
+  const rLen = Math.hypot(rx, ry, rz);
+  if (rLen < 1e-8) {
+    // Calm eye center singularity
+    out.vx = 0;
+    out.vy = 0;
+    out.vz = 0;
+    out.blendWeight = 0.85;
+    out.speedMs = 0;
+    out.vorticityScale = vortex.vorticityScale;
+    out.spiralCurvature = 0;
+    return true;
+  }
+  const invR = 1 / rLen;
+  rx *= invR;
+  ry *= invR;
+  rz *= invR;
+
+  // Counter-clockwise unit tangent vector looking down onto P: t_ccw = P x r_out
+  const tx = (py * rz - pz * ry) * vortex.spinSign;
+  const ty = (pz * rx - px * rz) * vortex.spinSign;
+  const tz = (px * ry - py * rx) * vortex.spinSign;
+
+  // Dynamic rotational vorticity boost driven by central pressure deficit & category
+  const vorticityMod = clamp(0.84 + vortex.vorticityScale * 0.20, 0.76, 1.38);
+
+  let tanSpeed = 0;
+  let outerFade = 1;
+  if (dKm < vortex.coreRadiusKm) {
+    const rRatio = dKm / Math.max(1e-3, vortex.coreRadiusKm);
+    const coreExp = 1.22 + 0.12 * clamp(vortex.vorticityScale, 0.5, 2.5);
+    tanSpeed = vortex.maxWindMs * vorticityMod * Math.pow(rRatio, coreExp);
+  } else {
+    const decayExp = 0.5 + clamp((vortex.vorticityScale - 1.0) * 0.06, -0.04, 0.12);
+    const rankine =
+      vortex.maxWindMs * vorticityMod * Math.pow(vortex.coreRadiusKm / dKm, decayExp);
+    const fadeStart = vortex.radiusKm * 0.68;
+    const tOut = clamp(
+      (dKm - fadeStart) / Math.max(1e-3, vortex.outerInfluenceKm - fadeStart),
+      0,
+      1
+    );
+    outerFade = 1 - tOut * tOut * (3 - 2 * tOut);
+    tanSpeed = rankine * outerFade;
+  }
+
+  // Radius-adjusted spiral inflow curvature:
+  // Deep low-pressure / high-category cores maintain tighter, more circular eyewall flow,
+  // while outer rainbands relative to real radiusKm pull inward along curved spiral arms.
+  const eyeInflowFade =
+    dKm < vortex.coreRadiusKm
+      ? clamp((dKm / Math.max(1e-3, vortex.coreRadiusKm) - 0.16) / 0.84, 0, 1)
+      : 1;
+  const relRadius = clamp(dKm / Math.max(1, vortex.radiusKm), 0, 1.45);
+  const baseInflowRatio = clamp(
+    0.42 / Math.pow(Math.max(0.5, vortex.vorticityScale), 0.34),
+    0.15,
+    0.45
+  );
+  const spiralInflowRatio = baseInflowRatio * (0.72 + 0.48 * relRadius) * eyeInflowFade;
+  const radialInflowSpeed = tanSpeed * spiralInflowRatio;
+
+  out.vx = tx * tanSpeed - rx * radialInflowSpeed;
+  out.vy = ty * tanSpeed - ry * radialInflowSpeed;
+  out.vz = tz * tanSpeed - rz * radialInflowSpeed;
+  out.speedMs = Math.hypot(tanSpeed, radialInflowSpeed);
+  out.blendWeight =
+    dKm < vortex.coreRadiusKm
+      ? 0.94
+      : clamp(outerFade * 0.94, 0, 0.94);
+  out.vorticityScale = vortex.vorticityScale * outerFade;
+  out.spiralCurvature = tanSpeed > 1e-4 ? radialInflowSpeed / tanSpeed : 0;
+  return true;
+}
+
+const _scratchCycloneSample: CycloneSampleResult = {
+  vx: 0,
+  vy: 0,
+  vz: 0,
+  blendWeight: 0,
+  speedMs: 0,
+  vorticityScale: 0,
+  spiralCurvature: 0,
+};
+
+/**
+ * Samples global background wind at (lat, lng) combined with any active Rankine cyclone vortices.
+ */
+export function sampleWindFieldWithCyclones(
+  field: Pick<
+    GlobalWindFieldResponse,
+    'minLat' | 'maxLat' | 'latStepDeg' | 'minLng' | 'lngStepDeg' | 'rows' | 'cols' | 'uGrid' | 'vGrid'
+  >,
+  cyclones: readonly PreparedCycloneVortex[],
+  lat: number,
+  lng: number
+): { uEastMs: number; vNorthMs: number; speedMs: number; speedKmh: number } {
+  const base = sampleWindFieldAtLatLng(field, lat, lng);
+  if (cyclones.length === 0) {
+    return base;
+  }
+
+  const p = latLngToCartesian(lat, lng, 1);
+  let basis: ReturnType<typeof tangentEastNorthAtNormal> | null = null;
+  let uEastMs = base.uEastMs;
+  let vNorthMs = base.vNorthMs;
+
+  for (let i = 0; i < cyclones.length; i++) {
+    if (!samplePreparedCycloneAtNormal(cyclones[i], p.x, p.y, p.z, _scratchCycloneSample)) {
+      continue;
+    }
+    if (!basis) {
+      basis = tangentEastNorthAtNormal(p.x, p.y, p.z);
+    }
+    const cEast =
+      _scratchCycloneSample.vx * basis.ex +
+      _scratchCycloneSample.vy * basis.ey +
+      _scratchCycloneSample.vz * basis.ez;
+    const cNorth =
+      _scratchCycloneSample.vx * basis.northX +
+      _scratchCycloneSample.vy * basis.northY +
+      _scratchCycloneSample.vz * basis.northZ;
+    const w = _scratchCycloneSample.blendWeight;
+    uEastMs = uEastMs * (1 - w) + cEast;
+    vNorthMs = vNorthMs * (1 - w) + cNorth;
+  }
+
+  const speedMs = Math.hypot(uEastMs, vNorthMs);
+  return {
+    uEastMs,
+    vNorthMs,
+    speedMs,
+    speedKmh: speedMs * 3.6,
+  };
+}
+
+/**
+ * Computes legend max speed & peak coordinate accounting for both the global wind grid
+ * and any active tropical cyclones whose sustained winds exceed the grid peak.
+ */
+export function getEffectiveWindLegendMetrics(
+  field: GlobalWindFieldResponse,
+  cyclones: readonly CycloneVortexSpec[]
+): { maxSpeedKmh: number; peakPoint: WindPeakPoint | null; activeCycloneCount: number } {
+  let maxSpeedKmh = field.metrics.maxSpeedKmh;
+  let peakPoint = field.metrics.peakPoint;
+
+  for (const c of cyclones) {
+    const cycKmh = Math.round(c.maxWindMs * 3.6);
+    if (cycKmh > maxSpeedKmh) {
+      maxSpeedKmh = cycKmh;
+      peakPoint = {
+        lat: Number(c.lat.toFixed(2)),
+        lng: Number(c.lng.toFixed(2)),
+        speedKmh: cycKmh,
+        directionFromDeg: 0,
+      };
+    }
+  }
+
+  return {
+    maxSpeedKmh,
+    peakPoint,
+    activeCycloneCount: cyclones.length,
+  };
+}
+
+/**
+ * Physical angular advection scale on the unit sphere (radians/sec per m/s).
+ * Kept invariant with respect to camera altitude so real atmospheric velocity
+ * never slows down when zooming in or accelerates unnaturally when zooming out;
+ * apparent screen-space speed naturally scales as 1 / altitude.
+ */
+export const BASE_WIND_ADVECT_SCALE = 0.0056;
+
+export function computeWindAdvectionScale(_altitudeUnits: number): number {
+  return BASE_WIND_ADVECT_SCALE;
+}
+

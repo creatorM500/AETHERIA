@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import { clamp } from './geo.ts';
-import { isKnownBelowSeaBasin, sampleElevationGrid } from './terrainMath.ts';
+import {
+  isKnownBelowSeaBasin,
+  isPointInOceanWaterFeatures,
+  isPointInWaterFeatureRings,
+  sampleElevationGrid,
+} from './terrainMath.ts';
 import type {
   TerrainBuildingFootprint,
   TerrainChunkPayload,
@@ -28,12 +33,23 @@ export const ARCH_ROOF_PALETTE: ReadonlyArray<readonly [number, number, number]>
 
 export interface RawIndexedBuffers {
   pos: Float32Array;
-  norm: Float32Array;
-  col: Float32Array;
+  norm: Int8Array | Float32Array;
+  col: Uint8Array | Float32Array;
   uv?: Float32Array;
   index: Uint16Array | Uint32Array;
   vertexCount: number;
   indexCount: number;
+}
+
+export function estimateRawBuffersByteLength(raw: RawIndexedBuffers | null): number {
+  if (!raw) return 0;
+  return (
+    raw.pos.byteLength +
+    raw.norm.byteLength +
+    raw.col.byteLength +
+    (raw.uv ? raw.uv.byteLength : 0) +
+    raw.index.byteLength
+  );
 }
 
 export interface ChunkGeometryBuildInput {
@@ -46,6 +62,8 @@ export interface ChunkGeometryBuildInput {
   seedOffset: number;
   includeHoles: boolean;
   includeRoadsAndWater: boolean;
+  includeWater?: boolean;
+  skipWater?: boolean;
 }
 
 export interface ChunkGeometryBuildOutput {
@@ -58,21 +76,23 @@ export interface ChunkGeometryBuildOutput {
 
 export class IndexedTypedGeometryBuilder {
   private pos: Float32Array;
-  private norm: Float32Array;
-  private col: Float32Array;
+  private norm: Int8Array | Float32Array;
+  private col: Uint8Array | Float32Array;
   private uv: Float32Array | null;
   private indices: Uint32Array;
+  private compact: boolean;
   private vCount = 0;
   private vCap: number;
   private iCount = 0;
   private iCap: number;
 
-  constructor(initialVertices = 4096, withUv = false) {
+  constructor(initialVertices = 2048, withUv = false, compact = true) {
     this.vCap = Math.max(256, initialVertices);
     this.iCap = Math.max(512, Math.floor(this.vCap * 1.5));
+    this.compact = compact;
     this.pos = new Float32Array(this.vCap * 3);
-    this.norm = new Float32Array(this.vCap * 3);
-    this.col = new Float32Array(this.vCap * 3);
+    this.norm = compact ? new Int8Array(this.vCap * 3) : new Float32Array(this.vCap * 3);
+    this.col = compact ? new Uint8Array(this.vCap * 3) : new Float32Array(this.vCap * 3);
     this.uv = withUv ? new Float32Array(this.vCap * 2) : null;
     this.indices = new Uint32Array(this.iCap);
   }
@@ -87,11 +107,11 @@ export class IndexedTypedGeometryBuilder {
     nextPos.set(this.pos.subarray(0, this.vCount * 3));
     this.pos = nextPos;
 
-    const nextNorm = new Float32Array(nextCap * 3);
+    const nextNorm = this.compact ? new Int8Array(nextCap * 3) : new Float32Array(nextCap * 3);
     nextNorm.set(this.norm.subarray(0, this.vCount * 3));
     this.norm = nextNorm;
 
-    const nextCol = new Float32Array(nextCap * 3);
+    const nextCol = this.compact ? new Uint8Array(nextCap * 3) : new Float32Array(nextCap * 3);
     nextCol.set(this.col.subarray(0, this.vCount * 3));
     this.col = nextCol;
 
@@ -133,12 +153,21 @@ export class IndexedTypedGeometryBuilder {
     this.pos[i] = x;
     this.pos[i + 1] = y;
     this.pos[i + 2] = z;
-    this.norm[i] = nx;
-    this.norm[i + 1] = ny;
-    this.norm[i + 2] = nz;
-    this.col[i] = r;
-    this.col[i + 1] = g;
-    this.col[i + 2] = b;
+    if (this.compact) {
+      this.norm[i] = Math.round((nx < -1 ? -1 : nx > 1 ? 1 : nx) * 127);
+      this.norm[i + 1] = Math.round((ny < -1 ? -1 : ny > 1 ? 1 : ny) * 127);
+      this.norm[i + 2] = Math.round((nz < -1 ? -1 : nz > 1 ? 1 : nz) * 127);
+      this.col[i] = Math.round((r < 0 ? 0 : r > 1 ? 1 : r) * 255);
+      this.col[i + 1] = Math.round((g < 0 ? 0 : g > 1 ? 1 : g) * 255);
+      this.col[i + 2] = Math.round((b < 0 ? 0 : b > 1 ? 1 : b) * 255);
+    } else {
+      this.norm[i] = nx;
+      this.norm[i + 1] = ny;
+      this.norm[i + 2] = nz;
+      this.col[i] = r;
+      this.col[i + 1] = g;
+      this.col[i + 2] = b;
+    }
     if (this.uv) {
       const ui = idx * 2;
       this.uv[ui] = u;
@@ -635,8 +664,8 @@ export function buildChunkBuildingsRaw(opts: {
   } = opts;
 
   const metersToScene = metersToSceneY ?? chunkWidth / Math.max(180, spanMetersX);
-  const stdBuilder = new IndexedTypedGeometryBuilder(Math.min(180000, buildings.length * 18 + 512));
-  const towerBuilder = new IndexedTypedGeometryBuilder(4096);
+  const stdBuilder = new IndexedTypedGeometryBuilder(Math.min(72000, buildings.length * 14 + 256), false, true);
+  const towerBuilder = new IndexedTypedGeometryBuilder(1024, false, true);
   const baseCol = new THREE.Color();
   const roofCol = new THREE.Color();
   let builtCount = 0;
@@ -974,7 +1003,7 @@ export function buildChunkRoadsRaw(opts: {
   } = opts;
   if (!roads || roads.length === 0) return null;
 
-  const builder = new IndexedTypedGeometryBuilder(Math.min(48000, roads.length * 48 + 512), true);
+  const builder = new IndexedTypedGeometryBuilder(Math.min(32000, roads.length * 36 + 256), true, true);
   for (let i = 0; i < roads.length; i++) {
     const r = roads[i];
     const halfW = clamp(r.widthM * 0.5 * metersToSceneY, 0.05, 0.24);
@@ -1021,6 +1050,153 @@ export function buildChunkRoadsRaw(opts: {
   return builder.toRawBuffers();
 }
 
+function clipConvexPolyToUnitSquare(poly: Array<[number, number]>): Array<[number, number]> {
+  let pts = poly;
+  const clipEdge = (
+    input: Array<[number, number]>,
+    inside: (p: [number, number]) => boolean,
+    intersect: (a: [number, number], b: [number, number]) => [number, number]
+  ): Array<[number, number]> => {
+    if (input.length === 0) return [];
+    const out: Array<[number, number]> = [];
+    for (let i = 0; i < input.length; i++) {
+      const curr = input[i];
+      const prev = input[(i + input.length - 1) % input.length];
+      const currIn = inside(curr);
+      const prevIn = inside(prev);
+      if (currIn !== prevIn) {
+        out.push(intersect(prev, curr));
+      }
+      if (currIn) {
+        out.push(curr);
+      }
+    }
+    return out;
+  };
+
+  pts = clipEdge(
+    pts,
+    (p) => p[0] >= 0,
+    (a, b) => {
+      const t = (0 - a[0]) / (b[0] - a[0] || 1e-12);
+      return [0, a[1] + (b[1] - a[1]) * t];
+    }
+  );
+  pts = clipEdge(
+    pts,
+    (p) => p[0] <= 1,
+    (a, b) => {
+      const t = (1 - a[0]) / (b[0] - a[0] || 1e-12);
+      return [1, a[1] + (b[1] - a[1]) * t];
+    }
+  );
+  pts = clipEdge(
+    pts,
+    (p) => p[1] >= 0,
+    (a, b) => {
+      const t = (0 - a[1]) / (b[1] - a[1] || 1e-12);
+      return [a[0] + (b[0] - a[0]) * t, 0];
+    }
+  );
+  pts = clipEdge(
+    pts,
+    (p) => p[1] <= 1,
+    (a, b) => {
+      const t = (1 - a[1]) / (b[1] - a[1] || 1e-12);
+      return [a[0] + (b[0] - a[0]) * t, 1];
+    }
+  );
+  return pts;
+}
+
+function emitSubdividedWaterTriangle(
+  builder: IndexedTypedGeometryBuilder,
+  p0: [number, number],
+  p1: [number, number],
+  p2: [number, number],
+  y: number,
+  depthSampler: (u: number, v: number) => number,
+  chunkWidth: number,
+  chunkDepth: number,
+  maxEdgeUV = 0.085,
+  depthLeft = 3
+) {
+  const cross = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+  if (Math.abs(cross) < 1e-10) return;
+
+  // Enforce +Y upward-facing winding in Three.js XZ coordinates (negative cross in (u, v))
+  const a = p0;
+  const b = cross > 0 ? p2 : p1;
+  const c = cross > 0 ? p1 : p2;
+
+  if (depthLeft > 0) {
+    const d01 = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const d12 = Math.hypot(c[0] - b[0], c[1] - b[1]);
+    const d20 = Math.hypot(a[0] - c[0], a[1] - c[1]);
+    if (d01 > maxEdgeUV || d12 > maxEdgeUV || d20 > maxEdgeUV) {
+      if (d01 >= d12 && d01 >= d20) {
+        const m: [number, number] = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+        emitSubdividedWaterTriangle(builder, a, m, c, y, depthSampler, chunkWidth, chunkDepth, maxEdgeUV, depthLeft - 1);
+        emitSubdividedWaterTriangle(builder, m, b, c, y, depthSampler, chunkWidth, chunkDepth, maxEdgeUV, depthLeft - 1);
+        return;
+      }
+      if (d12 >= d01 && d12 >= d20) {
+        const m: [number, number] = [(b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5];
+        emitSubdividedWaterTriangle(builder, a, b, m, y, depthSampler, chunkWidth, chunkDepth, maxEdgeUV, depthLeft - 1);
+        emitSubdividedWaterTriangle(builder, a, m, c, y, depthSampler, chunkWidth, chunkDepth, maxEdgeUV, depthLeft - 1);
+        return;
+      }
+      const m: [number, number] = [(c[0] + a[0]) * 0.5, (c[1] + a[1]) * 0.5];
+      emitSubdividedWaterTriangle(builder, a, b, m, y, depthSampler, chunkWidth, chunkDepth, maxEdgeUV, depthLeft - 1);
+      emitSubdividedWaterTriangle(builder, m, b, c, y, depthSampler, chunkWidth, chunkDepth, maxEdgeUV, depthLeft - 1);
+      return;
+    }
+  }
+
+  builder.ensureVerts(3);
+  builder.ensureIndices(3);
+  const ia = builder.pushVertexFast(
+    (a[0] - 0.5) * chunkWidth,
+    y,
+    (a[1] - 0.5) * chunkDepth,
+    0,
+    1,
+    0,
+    depthSampler(a[0], a[1]),
+    0.5,
+    1.0,
+    a[0],
+    a[1]
+  );
+  const ib = builder.pushVertexFast(
+    (b[0] - 0.5) * chunkWidth,
+    y,
+    (b[1] - 0.5) * chunkDepth,
+    0,
+    1,
+    0,
+    depthSampler(b[0], b[1]),
+    0.5,
+    1.0,
+    b[0],
+    b[1]
+  );
+  const ic = builder.pushVertexFast(
+    (c[0] - 0.5) * chunkWidth,
+    y,
+    (c[1] - 0.5) * chunkDepth,
+    0,
+    1,
+    0,
+    depthSampler(c[0], c[1]),
+    0.5,
+    1.0,
+    c[0],
+    c[1]
+  );
+  builder.pushTri(ia, ib, ic);
+}
+
 export function buildChunkWaterRaw(opts: {
   waterFeatures: TerrainWaterFeature[];
   elevationsM: number[];
@@ -1048,66 +1224,98 @@ export function buildChunkWaterRaw(opts: {
     isCoastalTile,
   } = opts;
 
-  const seaY = (0 - baseElevationM) * metersToSceneY * verticalExaggeration + 0.035;
-  const builder = new IndexedTypedGeometryBuilder(8192, true);
+  const seaLift = clamp(1.05 * metersToSceneY * verticalExaggeration, 0.040, 0.074);
+  const seaY = (0 - baseElevationM) * metersToSceneY * verticalExaggeration + seaLift;
+  const builder = new IndexedTypedGeometryBuilder(2048, true, false);
 
-  // 1. Coastal sea plane cells wherever DEM reaches sea level (<= 0.35m) on non-basin coastal tiles
-  if (isCoastalTile && minElevationM <= 0.35 && rows >= 2 && cols >= 2) {
-    const cellWaterThresholdM = 0.35;
-    for (let r = 0; r < rows - 1; r++) {
-      const v0 = r / (rows - 1);
-      const v1 = (r + 1) / (rows - 1);
-      const z0 = (v0 - 0.5) * chunkDepth;
-      const z1 = (v1 - 0.5) * chunkDepth;
+  const cellWaterThresholdM = 0.42;
+  const oceanFeatures = waterFeatures.filter(
+    (wf) => wf.isPolygon && wf.kind === 'ocean' && wf.rings.length > 0
+  );
+  const hasOceanPolys = isCoastalTile && oceanFeatures.length > 0;
+  const hasCoastalDem = isCoastalTile && minElevationM <= cellWaterThresholdM && rows >= 2 && cols >= 2;
+  const hasCoastalSea = hasOceanPolys || hasCoastalDem;
 
-      for (let c = 0; c < cols - 1; c++) {
-        const e00 = elevationsM[r * cols + c] ?? 0;
-        const e10 = elevationsM[r * cols + (c + 1)] ?? 0;
-        const e01 = elevationsM[(r + 1) * cols + c] ?? 0;
-        const e11 = elevationsM[(r + 1) * cols + (c + 1)] ?? 0;
-        const cellMin = Math.min(e00, e10, e01, e11);
-        if (cellMin > cellWaterThresholdM) continue;
-
-        const u0 = c / (cols - 1);
-        const u1 = (c + 1) / (cols - 1);
-        const x0 = (u0 - 0.5) * chunkWidth;
-        const x1 = (u1 - 0.5) * chunkWidth;
-
-        // col.r encodes normalized shallow shore proximity (1 = deep water, 0 = shoreline)
-        const d00 = clamp((0.4 - e00) / 3.5, 0, 1);
-        const d10 = clamp((0.4 - e10) / 3.5, 0, 1);
-        const d01 = clamp((0.4 - e01) / 3.5, 0, 1);
-        const d11 = clamp((0.4 - e11) / 3.5, 0, 1);
-
-        builder.ensureVerts(4);
-        builder.ensureIndices(6);
-        const i00 = builder.pushVertexFast(x0, seaY, z0, 0, 1, 0, d00, 0.5, 1.0, u0, v0);
-        const i10 = builder.pushVertexFast(x1, seaY, z0, 0, 1, 0, d10, 0.5, 1.0, u1, v0);
-        const i01 = builder.pushVertexFast(x0, seaY, z1, 0, 1, 0, d01, 0.5, 1.0, u0, v1);
-        const i11 = builder.pushVertexFast(x1, seaY, z1, 0, 1, 0, d11, 0.5, 1.0, u1, v1);
-        builder.pushTri(i00, i01, i10);
-        builder.pushTri(i10, i01, i11);
+  let landDist: Float32Array | null = null;
+  let hasAnyLand = false;
+  if (hasCoastalSea && rows >= 2 && cols >= 2) {
+    const maxCellSpan = Math.max(12, Math.ceil(5.2 / Math.max(0.25, chunkWidth / Math.max(1, cols - 1))));
+    landDist = new Float32Array(rows * cols);
+    for (let r = 0; r < rows; r++) {
+      const v = r / (rows - 1);
+      for (let c = 0; c < cols; c++) {
+        const u = c / (cols - 1);
+        const idx = r * cols + c;
+        const isWaterVert = hasOceanPolys
+          ? isPointInOceanWaterFeatures(u, v, oceanFeatures) || (elevationsM[idx] ?? 0) <= cellWaterThresholdM
+          : (elevationsM[idx] ?? 0) <= cellWaterThresholdM;
+        if (!isWaterVert) hasAnyLand = true;
+        landDist[idx] = isWaterVert ? maxCellSpan : 0;
+      }
+    }
+    if (hasAnyLand) {
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const idx = r * cols + c;
+          let d = landDist[idx];
+          if (r > 0) d = Math.min(d, landDist[(r - 1) * cols + c] + 1);
+          if (c > 0) d = Math.min(d, landDist[r * cols + (c - 1)] + 1);
+          if (r > 0 && c > 0) d = Math.min(d, landDist[(r - 1) * cols + (c - 1)] + 1.414);
+          if (r > 0 && c < cols - 1) d = Math.min(d, landDist[(r - 1) * cols + (c + 1)] + 1.414);
+          landDist[idx] = d;
+        }
+      }
+      for (let r = rows - 1; r >= 0; r--) {
+        for (let c = cols - 1; c >= 0; c--) {
+          const idx = r * cols + c;
+          let d = landDist[idx];
+          if (r < rows - 1) d = Math.min(d, landDist[(r + 1) * cols + c] + 1);
+          if (c < cols - 1) d = Math.min(d, landDist[r * cols + (c + 1)] + 1);
+          if (r < rows - 1 && c < cols - 1) d = Math.min(d, landDist[(r + 1) * cols + (c + 1)] + 1.414);
+          if (r < rows - 1 && c > 0) d = Math.min(d, landDist[(r + 1) * cols + (c - 1)] + 1.414);
+          landDist[idx] = d;
+        }
       }
     }
   }
 
-  // 2. Explicit OSM MVT Water Polygons (lakes, riverbanks, canals, bays) & Waterways (rivers, canals, streams)
-  for (let i = 0; i < waterFeatures.length; i++) {
-    const wf = waterFeatures[i];
-    if (wf.isPolygon && wf.rings.length > 0) {
-      let contour = cleanRing2D(
-        wf.rings[0].map(([u, v]) => new THREE.Vector2((clamp(u, 0, 1) - 0.5) * chunkWidth, -(clamp(v, 0, 1) - 0.5) * chunkDepth))
-      );
+  const scenePerCell = cols > 1 ? chunkWidth / (cols - 1) : 1.0;
+  const sampleDepthAtUV = (u: number, v: number): number => {
+    const cu = clamp(u, 0, 1);
+    const cv = clamp(v, 0, 1);
+    if (!landDist || !hasAnyLand || rows < 2 || cols < 2) return 0.88;
+    const fx = cu * (cols - 1);
+    const fz = cv * (rows - 1);
+    const c0 = Math.floor(fx);
+    const r0 = Math.floor(fz);
+    const c1 = Math.min(cols - 1, c0 + 1);
+    const r1 = Math.min(rows - 1, r0 + 1);
+    const tx = fx - c0;
+    const tz = fz - r0;
+    const d00 = landDist[r0 * cols + c0] ?? 0;
+    const d10 = landDist[r0 * cols + c1] ?? d00;
+    const d01 = landDist[r1 * cols + c0] ?? d00;
+    const d11 = landDist[r1 * cols + c1] ?? d00;
+    const distCells = (d00 + (d10 - d00) * tx) * (1 - tz) + (d01 + (d11 - d01) * tx) * tz;
+    // Scale to physical scene units so Tier-1 (48u) and Tier-2 (192u) match seamlessly across chunk edges
+    const distScene = distCells * scenePerCell;
+    const shoreDepth = clamp(0.10 + (distScene / 3.4) * 0.78, 0.10, 0.88);
+    const elev = sampleElevationGrid(elevationsM, rows, cols, cu, cv);
+    const bathyBoost = elev < -0.5 ? clamp((-0.5 - elev) / 4.0, 0, 0.25) : 0;
+    return clamp(shoreDepth + bathyBoost, 0.10, 0.90);
+  };
+
+  // 1A. Authoritative 1m OSM MVT 'ocean' / bay / harbor polygons (clipped to [0,1] & subdivided for coastal gradient)
+  if (hasOceanPolys) {
+    for (let i = 0; i < oceanFeatures.length; i++) {
+      const wf = oceanFeatures[i];
+      let contour = cleanRing2D(wf.rings[0].map(([u, v]) => new THREE.Vector2(u, -v)));
       if (contour.length < 3) continue;
       if (THREE.ShapeUtils.isClockWise(contour)) contour = contour.reverse();
 
       const holes: THREE.Vector2[][] = [];
       for (let hIdx = 1; hIdx < wf.rings.length; hIdx++) {
-        let hole = cleanRing2D(
-          wf.rings[hIdx].map(
-            ([u, v]) => new THREE.Vector2((clamp(u, 0, 1) - 0.5) * chunkWidth, -(clamp(v, 0, 1) - 0.5) * chunkDepth)
-          )
-        );
+        let hole = cleanRing2D(wf.rings[hIdx].map(([u, v]) => new THREE.Vector2(u, -v)));
         if (hole.length < 3) continue;
         if (!THREE.ShapeUtils.isClockWise(hole)) hole = hole.reverse();
         holes.push(hole);
@@ -1121,86 +1329,206 @@ export function buildChunkWaterRaw(opts: {
       }
       if (faces.length === 0) continue;
 
-      let waterElevM = 0;
-      if (wf.kind !== 'ocean') {
-        let minSample = Infinity;
-        let sumSample = 0;
-        const outerPts = wf.rings[0];
-        for (let k = 0; k < outerPts.length; k++) {
-          const s = sampleElevationGrid(
+      const flatUV: Array<[number, number]> = contour.map((p) => [p.x, -p.y]);
+      for (const h of holes) {
+        for (const p of h) flatUV.push([p.x, -p.y]);
+      }
+
+      for (let f = 0; f < faces.length; f++) {
+        const [ia, ib, ic] = faces[f];
+        if (ia >= flatUV.length || ib >= flatUV.length || ic >= flatUV.length) continue;
+        const clipped = clipConvexPolyToUnitSquare([flatUV[ia], flatUV[ib], flatUV[ic]]);
+        if (clipped.length < 3) continue;
+        for (let t = 1; t < clipped.length - 1; t++) {
+          emitSubdividedWaterTriangle(
+            builder,
+            clipped[0],
+            clipped[t],
+            clipped[t + 1],
+            seaY,
+            sampleDepthAtUV,
+            chunkWidth,
+            chunkDepth,
+            0.085,
+            3
+          );
+        }
+      }
+    }
+  } else if (hasCoastalDem && landDist) {
+    // 1B. DEM coastal sea fallback when MVT ocean polygon is unavailable
+    for (let r = 0; r < rows - 1; r++) {
+      const v0 = r / (rows - 1);
+      const v1 = (r + 1) / (rows - 1);
+      const z0 = (v0 - 0.5) * chunkDepth;
+      const z1 = (v1 - 0.5) * chunkDepth;
+
+      for (let c = 0; c < cols - 1; c++) {
+        const e00 = elevationsM[r * cols + c] ?? 0;
+        const e10 = elevationsM[r * cols + (c + 1)] ?? 0;
+        const e01 = elevationsM[(r + 1) * cols + c] ?? 0;
+        const e11 = elevationsM[(r + 1) * cols + (c + 1)] ?? 0;
+        if (Math.min(e00, e10, e01, e11) > cellWaterThresholdM) continue;
+
+        const u0 = c / (cols - 1);
+        const u1 = (c + 1) / (cols - 1);
+        const x0 = (u0 - 0.5) * chunkWidth;
+        const x1 = (u1 - 0.5) * chunkWidth;
+
+        const d00 = sampleDepthAtUV(u0, v0);
+        const d10 = sampleDepthAtUV(u1, v0);
+        const d01 = sampleDepthAtUV(u0, v1);
+        const d11 = sampleDepthAtUV(u1, v1);
+
+        builder.ensureVerts(4);
+        builder.ensureIndices(6);
+        const i00 = builder.pushVertexFast(x0, seaY, z0, 0, 1, 0, d00, 0.5, 1.0, u0, v0);
+        const i10 = builder.pushVertexFast(x1, seaY, z0, 0, 1, 0, d10, 0.5, 1.0, u1, v0);
+        const i01 = builder.pushVertexFast(x0, seaY, z1, 0, 1, 0, d01, 0.5, 1.0, u0, v1);
+        const i11 = builder.pushVertexFast(x1, seaY, z1, 0, 1, 0, d11, 0.5, 1.0, u1, v1);
+        builder.pushTri(i00, i01, i10);
+        builder.pushTri(i10, i01, i11);
+      }
+    }
+  }
+
+  // 2. Inland Lakes, Canals, Riverbanks & Waterway Ribbons (deduplicated against ocean polygons)
+  for (let i = 0; i < waterFeatures.length; i++) {
+    const wf = waterFeatures[i];
+    if (wf.isPolygon && wf.rings.length > 0) {
+      if (wf.kind === 'ocean') continue;
+
+      let minSample = Infinity;
+      let sumSample = 0;
+      let cu = 0;
+      let cv = 0;
+      const outerPts = wf.rings[0];
+      for (let k = 0; k < outerPts.length; k++) {
+        const pu = clamp(outerPts[k][0], 0, 1);
+        const pv = clamp(outerPts[k][1], 0, 1);
+        cu += pu;
+        cv += pv;
+        const s = sampleElevationGrid(elevationsM, rows, cols, pu, pv);
+        if (s < minSample) minSample = s;
+        sumSample += s;
+      }
+      const nPts = Math.max(1, outerPts.length);
+      const avgSample = sumSample / nPts;
+      cu /= nPts;
+      cv /= nPts;
+
+      if (
+        hasOceanPolys &&
+        minSample <= 0.8 &&
+        avgSample <= 2.4 &&
+        isPointInOceanWaterFeatures(cu, cv, oceanFeatures)
+      ) {
+        continue;
+      }
+
+      if (
+        !hasOceanPolys &&
+        hasCoastalDem &&
+        minSample <= 0.45 &&
+        avgSample <= 1.25 &&
+        (wf.kind === 'river' || wf.kind === 'canal' || wf.kind === 'lake')
+      ) {
+        continue;
+      }
+
+      let contour = cleanRing2D(wf.rings[0].map(([u, v]) => new THREE.Vector2(u, -v)));
+      if (contour.length < 3) continue;
+      if (THREE.ShapeUtils.isClockWise(contour)) contour = contour.reverse();
+
+      const holes: THREE.Vector2[][] = [];
+      for (let hIdx = 1; hIdx < wf.rings.length; hIdx++) {
+        let hole = cleanRing2D(wf.rings[hIdx].map(([u, v]) => new THREE.Vector2(u, -v)));
+        if (hole.length < 3) continue;
+        if (!THREE.ShapeUtils.isClockWise(hole)) hole = hole.reverse();
+        holes.push(hole);
+      }
+
+      let faces: number[][];
+      try {
+        faces = THREE.ShapeUtils.triangulateShape(contour, holes);
+      } catch {
+        continue;
+      }
+      if (faces.length === 0) continue;
+
+      const clampedCandidate = Math.min(avgSample + 0.15, minSample + 1.2);
+      const waterElevM = isCoastalTile ? Math.max(0.05, clampedCandidate) : clampedCandidate;
+      const wy = (waterElevM - baseElevationM) * metersToSceneY * verticalExaggeration + 0.045;
+      const depthVal = wf.kind === 'lake' ? 0.68 : 0.56;
+
+      const flatUV: Array<[number, number]> = contour.map((p) => [p.x, -p.y]);
+      for (const h of holes) {
+        for (const p of h) flatUV.push([p.x, -p.y]);
+      }
+
+      for (let f = 0; f < faces.length; f++) {
+        const [ia, ib, ic] = faces[f];
+        if (ia >= flatUV.length || ib >= flatUV.length || ic >= flatUV.length) continue;
+        const clipped = clipConvexPolyToUnitSquare([flatUV[ia], flatUV[ib], flatUV[ic]]);
+        if (clipped.length < 3) continue;
+        for (let t = 1; t < clipped.length - 1; t++) {
+          emitSubdividedWaterTriangle(
+            builder,
+            clipped[0],
+            clipped[t],
+            clipped[t + 1],
+            wy,
+            () => depthVal,
+            chunkWidth,
+            chunkDepth,
+            0.25,
+            1
+          );
+        }
+      }
+    } else if (!wf.isPolygon && wf.rings.length > 0 && wf.rings[0].length >= 2) {
+      // Skip open-bay/ocean waterway centerlines already covered by coastal sea/ocean polygons
+      const pts = wf.rings[0];
+      const filteredRun: Array<[number, number]> = [];
+      const halfW = clamp((wf.widthM ?? 14) * 0.5 * metersToSceneY, 0.08, 0.42);
+      const flushRun = () => {
+        if (filteredRun.length >= 2) {
+          emitTerrainDrapedRibbon(
+            builder,
+            filteredRun,
+            halfW,
+            0.055,
             elevationsM,
             rows,
             cols,
-            clamp(outerPts[k][0], 0, 1),
-            clamp(outerPts[k][1], 0, 1)
+            baseElevationM,
+            metersToSceneY,
+            chunkWidth,
+            chunkDepth,
+            verticalExaggeration,
+            [0.24, 0.6, 1.0],
+            [0.64, 0.6, 1.0]
           );
-          if (s < minSample) minSample = s;
-          sumSample += s;
         }
-        const avgSample = sumSample / Math.max(1, outerPts.length);
-        if (isCoastalTile && wf.kind === 'river' && minSample <= 1.2) {
-          waterElevM = 0;
-        } else {
-          // Place inland lake/canal water slightly above the lowest sampled basin floor while staying inset from banks
-          waterElevM = Math.min(avgSample + 0.15, minSample + 1.2);
+        filteredRun.length = 0;
+      };
+
+      for (let p = 0; p < pts.length; p++) {
+        const [u, v] = pts[p];
+        if (hasOceanPolys && isPointInOceanWaterFeatures(u, v, oceanFeatures)) {
+          flushRun();
+          continue;
         }
+        if (hasCoastalDem) {
+          const elev = sampleElevationGrid(elevationsM, rows, cols, clamp(u, 0, 1), clamp(v, 0, 1));
+          if (elev <= cellWaterThresholdM) {
+            flushRun();
+            continue;
+          }
+        }
+        filteredRun.push([u, v]);
       }
-
-      const wy =
-        wf.kind === 'ocean' || (isCoastalTile && wf.kind === 'river' && waterElevM === 0)
-          ? seaY + 0.005
-          : (waterElevM - baseElevationM) * metersToSceneY * verticalExaggeration + 0.055;
-
-      const flat2D: THREE.Vector2[] = [...contour];
-      for (const h of holes) {
-        for (const p of h) flat2D.push(p);
-      }
-      builder.ensureVerts(flat2D.length);
-      builder.ensureIndices(faces.length * 3);
-
-      const depthVal = wf.kind === 'ocean' ? 0.85 : wf.kind === 'lake' ? 0.72 : 0.62;
-      const vIdx = new Int32Array(flat2D.length);
-      for (let k = 0; k < flat2D.length; k++) {
-        const p = flat2D[k];
-        const x = p.x;
-        const z = -p.y;
-        vIdx[k] = builder.pushVertexFast(
-          x,
-          wy,
-          z,
-          0,
-          1,
-          0,
-          depthVal,
-          0.6,
-          1.0,
-          x / chunkWidth + 0.5,
-          z / chunkDepth + 0.5
-        );
-      }
-      for (let f = 0; f < faces.length; f++) {
-        const [ia, ib, ic] = faces[f];
-        if (ia >= flat2D.length || ib >= flat2D.length || ic >= flat2D.length) continue;
-        builder.pushTri(vIdx[ia], vIdx[ib], vIdx[ic]);
-      }
-    } else if (!wf.isPolygon && wf.rings.length > 0 && wf.rings[0].length >= 2) {
-      const halfW = clamp((wf.widthM ?? 14) * 0.5 * metersToSceneY, 0.08, 0.42);
-      emitTerrainDrapedRibbon(
-        builder,
-        wf.rings[0],
-        halfW,
-        0.065,
-        elevationsM,
-        rows,
-        cols,
-        baseElevationM,
-        metersToSceneY,
-        chunkWidth,
-        chunkDepth,
-        verticalExaggeration,
-        [0.18, 0.6, 1.0],
-        [0.68, 0.6, 1.0]
-      );
+      flushRun();
     }
   }
 
@@ -1218,25 +1546,30 @@ export function buildAllChunkGeometriesRaw(input: ChunkGeometryBuildInput): Chun
     seedOffset,
     includeHoles,
     includeRoadsAndWater,
+    includeWater = false,
+    skipWater = false,
   } = input;
 
-  const bRes = buildChunkBuildingsRaw({
-    buildings: payload.buildings,
-    elevationsM: payload.elevationsM,
-    rows: payload.rows,
-    cols: payload.cols,
-    minElevationM: payload.minElevationM,
-    baseElevationM,
-    spanMetersX: payload.spanMetersX,
-    chunkWidth,
-    chunkDepth,
-    verticalExaggeration,
-    metersToSceneY,
-    seedOffset,
-    includeHoles,
-  });
+  const bRes =
+    payload.buildings.length > 0
+      ? buildChunkBuildingsRaw({
+          buildings: payload.buildings,
+          elevationsM: payload.elevationsM,
+          rows: payload.rows,
+          cols: payload.cols,
+          minElevationM: payload.minElevationM,
+          baseElevationM,
+          spanMetersX: payload.spanMetersX,
+          chunkWidth,
+          chunkDepth,
+          verticalExaggeration,
+          metersToSceneY,
+          seedOffset,
+          includeHoles,
+        })
+      : { stdGeo: null, towerGeo: null, builtCount: 0 };
 
-  if (!includeRoadsAndWater) {
+  if (!includeRoadsAndWater && !includeWater) {
     return {
       ...bRes,
       roadsGeo: null,
@@ -1248,33 +1581,36 @@ export function buildAllChunkGeometriesRaw(input: ChunkGeometryBuildInput): Chun
   const midLng = (payload.bounds.west + payload.bounds.east) * 0.5;
   const isCoastalTile = !isKnownBelowSeaBasin(midLat, midLng);
 
-  const roadsGeo = payload.roads?.length
-    ? buildChunkRoadsRaw({
-        roads: payload.roads,
+  const roadsGeo =
+    includeRoadsAndWater && payload.roads?.length
+      ? buildChunkRoadsRaw({
+          roads: payload.roads,
+          elevationsM: payload.elevationsM,
+          rows: payload.rows,
+          cols: payload.cols,
+          baseElevationM,
+          metersToSceneY,
+          chunkWidth,
+          chunkDepth,
+          verticalExaggeration,
+        })
+      : null;
+
+  const waterGeo = skipWater
+    ? null
+    : buildChunkWaterRaw({
+        waterFeatures: payload.waterFeatures ?? [],
         elevationsM: payload.elevationsM,
         rows: payload.rows,
         cols: payload.cols,
+        minElevationM: payload.minElevationM,
         baseElevationM,
         metersToSceneY,
         chunkWidth,
         chunkDepth,
         verticalExaggeration,
-      })
-    : null;
-
-  const waterGeo = buildChunkWaterRaw({
-    waterFeatures: payload.waterFeatures ?? [],
-    elevationsM: payload.elevationsM,
-    rows: payload.rows,
-    cols: payload.cols,
-    minElevationM: payload.minElevationM,
-    baseElevationM,
-    metersToSceneY,
-    chunkWidth,
-    chunkDepth,
-    verticalExaggeration,
-    isCoastalTile,
-  });
+        isCoastalTile,
+      });
 
   return {
     ...bRes,

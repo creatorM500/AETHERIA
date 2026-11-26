@@ -1,17 +1,26 @@
 import * as THREE from 'three';
 import { clamp } from '../shared/geo.ts';
-import type { GlobalWindFieldResponse } from '../shared/types.ts';
+import type { GlobalEvent, GlobalWindFieldResponse } from '../shared/types.ts';
 import {
   buildAtmosphericBaselineWindField,
+  computeWindAdvectionScale,
+  EARTH_RADIUS_KM,
+  extractCycloneVorticesFromEvents,
+  prepareCycloneVortices,
+  samplePreparedCycloneAtNormal,
   sampleWindFieldAtLatLng,
   tangentEastNorthAtNormal,
   windSpeedToColorRGB,
+  type CycloneSampleResult,
+  type PreparedCycloneVortex,
 } from '../shared/windField.ts';
 
 const PARTICLE_COUNT = 4200;
 const SPINE_POINTS = 9;
 const VERTS_PER_PARTICLE = SPINE_POINTS * 2;
 const RAD_TO_DEG = 180 / Math.PI;
+const MAX_VORTEX_PARTICLE_SHARE = 0.34;
+const MAX_PARTICLES_PER_CYCLONE = 280;
 
 function createSeededRandom(seed: number): () => number {
   let s = seed >>> 0;
@@ -27,8 +36,8 @@ function createSeededRandom(seed: number): () => number {
  * 3D Spherical Wind Particle Streamline Layer:
  * - Renders 4,200 tapered aerodynamic 3D ribbons in a single Mesh draw call
  * - Advects particles across the sphere using real-time bilinear (u, v) wind vectors
- * - Balances global circulation coverage with adaptive regional focus seeding when zoomed in
- * - Encodes wind velocity via dynamic color ramp & streamline length, and direction via taper/alpha
+ * - Superposes real-scale Rankine tropical cyclone vortices (Coriolis CW/CCW + inward spiral)
+ * - Uses RK2 midpoint integration inside vortices so streamlines curve smoothly around the eye
  */
 export class GlobeWindParticleLayer {
   public readonly group = new THREE.Group();
@@ -36,6 +45,7 @@ export class GlobeWindParticleLayer {
   private globeRadius: number;
   private enabled = true;
   private windField: GlobalWindFieldResponse;
+  private cyclones: PreparedCycloneVortex[] = [];
   private referenceMaxMs = 20.0;
   private rand = createSeededRandom(20261121);
   private lastAltitude = 16.0;
@@ -44,6 +54,7 @@ export class GlobeWindParticleLayer {
   private focusZ = 0.94;
   private wasRegionalZoom = false;
   private lastFieldSignature = '';
+  private lastCyclonesSignature = '';
 
   // Per-particle state (zero GC in render loop)
   private nx = new Float32Array(PARTICLE_COUNT);
@@ -52,10 +63,40 @@ export class GlobeWindParticleLayer {
   private age = new Float32Array(PARTICLE_COUNT);
   private maxAge = new Float32Array(PARTICLE_COUNT);
   private particleSpeedMs = new Float32Array(PARTICLE_COUNT);
+  private particleVortexIdx = new Int16Array(PARTICLE_COUNT);
+  private particleVortexBlend = new Uint8Array(PARTICLE_COUNT);
   // Spine ring buffer flattened: particle i, spine j (0=oldest tail .. SPINE_POINTS-1=head)
   private spineX = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
   private spineY = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
   private spineZ = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
+
+  private readonly scratchCyclone: CycloneSampleResult = {
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    blendWeight: 0,
+    speedMs: 0,
+    vorticityScale: 0,
+    spiralCurvature: 0,
+  };
+  private readonly velScratch1 = {
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    speedMs: 0,
+    vortexWeight: 0,
+    vorticityScale: 0,
+    cycloneAngleRad: 0.05,
+  };
+  private readonly velScratch2 = {
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    speedMs: 0,
+    vortexWeight: 0,
+    vorticityScale: 0,
+    cycloneAngleRad: 0.05,
+  };
 
   // GPU mesh & buffers
   private geometry: THREE.BufferGeometry;
@@ -71,7 +112,8 @@ export class GlobeWindParticleLayer {
   constructor(globeRadius: number) {
     this.globeRadius = globeRadius;
     this.windField = buildAtmosphericBaselineWindField();
-    this.referenceMaxMs = Math.max(18.0, (this.windField.metrics.maxSpeedKmh || 65) / 3.6);
+    this.particleVortexIdx.fill(-1);
+    this.recomputeReferenceMaxMs();
 
     const totalVerts = PARTICLE_COUNT * VERTS_PER_PARTICLE;
     const totalIndices = PARTICLE_COUNT * (SPINE_POINTS - 1) * 6;
@@ -154,14 +196,57 @@ export class GlobeWindParticleLayer {
     this.rebuildRibbonGeometry(this.lastAltitude);
   }
 
+  private recomputeReferenceMaxMs() {
+    let maxMs = Math.max(18.0, (this.windField.metrics.maxSpeedKmh || 65) / 3.6);
+    for (let i = 0; i < this.cyclones.length; i++) {
+      maxMs = Math.max(maxMs, this.cyclones[i].maxWindMs);
+    }
+    this.referenceMaxMs = clamp(maxMs, 18.0, 48.0);
+  }
+
+  private assignVortexSlots() {
+    this.particleVortexIdx.fill(-1);
+    if (this.cyclones.length === 0) return;
+    const perCyclone = Math.min(
+      MAX_PARTICLES_PER_CYCLONE,
+      Math.floor((PARTICLE_COUNT * MAX_VORTEX_PARTICLE_SHARE) / this.cyclones.length)
+    );
+    if (perCyclone <= 0) return;
+
+    let ptr = 0;
+    for (let c = 0; c < this.cyclones.length; c++) {
+      for (let k = 0; k < perCyclone && ptr < PARTICLE_COUNT; k++, ptr++) {
+        this.particleVortexIdx[ptr] = c;
+      }
+    }
+  }
+
   private respawnParticle(i: number, randomAge = false) {
     let px = 0;
     let py = 0;
     let pz = 1;
+    const assignedCycloneIdx = this.particleVortexIdx[i];
 
-    // 45% of particles concentrate inside the visible hemisphere cone when zoomed into a region
-    const useRegionalCone = this.lastAltitude < 8.5 && i % 9 < 4;
-    if (useRegionalCone) {
+    if (assignedCycloneIdx >= 0 && assignedCycloneIdx < this.cyclones.length) {
+      const cyc = this.cyclones[assignedCycloneIdx];
+      const basis = tangentEastNorthAtNormal(cyc.cx, cyc.cy, cyc.cz);
+      const minAng = (cyc.coreRadiusKm * 0.22) / EARTH_RADIUS_KM;
+      const maxAng = cyc.nominalAngleRad * 1.45;
+      const ang = Math.sqrt(minAng * minAng + this.rand() * Math.max(1e-6, maxAng * maxAng - minAng * minAng));
+      const az = this.rand() * Math.PI * 2;
+      const cosA = Math.cos(ang);
+      const sinA = Math.sin(ang);
+      const cosAz = Math.cos(az);
+      const sinAz = Math.sin(az);
+      px = cyc.cx * cosA + sinA * (cosAz * basis.ex + sinAz * basis.northX);
+      py = cyc.cy * cosA + sinA * (cosAz * basis.ey + sinAz * basis.northY);
+      pz = cyc.cz * cosA + sinA * (cosAz * basis.ez + sinAz * basis.northZ);
+      const inv = 1 / Math.max(1e-7, Math.hypot(px, py, pz));
+      px *= inv;
+      py *= inv;
+      pz *= inv;
+    } else if (this.lastAltitude < 8.5 && i % 9 < 4) {
+      // 45% of non-cyclone particles concentrate inside the visible hemisphere cone when zoomed in
       const basis = tangentEastNorthAtNormal(this.focusX, this.focusY, this.focusZ);
       const maxAngle = clamp(this.lastAltitude * 0.095, 0.08, 0.72);
       const ang = Math.sqrt(this.rand()) * maxAngle;
@@ -196,8 +281,9 @@ export class GlobeWindParticleLayer {
     this.nx[i] = px;
     this.ny[i] = py;
     this.nz[i] = pz;
+    this.particleVortexBlend[i] = assignedCycloneIdx >= 0 ? 220 : 0;
 
-    const life = 1.8 + this.rand() * 2.4;
+    const life = assignedCycloneIdx >= 0 ? 1.15 + this.rand() * 1.45 : 1.8 + this.rand() * 2.4;
     this.maxAge[i] = life;
     this.age[i] = randomAge ? this.rand() * life : 0;
 
@@ -215,7 +301,58 @@ export class GlobeWindParticleLayer {
     }
   }
 
-  private advectParticle(i: number, dtSec: number, altFactor: number) {
+  /**
+   * Evaluates combined global + cyclone 3D tangent velocity (m/s) at sphere normal (px, py, pz)
+   * into a pre-allocated output struct (zero GC in render loop).
+   */
+  private sampleTangentVelocityAtNormal(
+    px: number,
+    py: number,
+    pz: number,
+    out: typeof this.velScratch1
+  ): typeof this.velScratch1 {
+    const lat = Math.asin(clamp(py, -1, 1)) * RAD_TO_DEG;
+    const lng = Math.atan2(-pz, px) * RAD_TO_DEG;
+
+    const { uEastMs, vNorthMs } = sampleWindFieldAtLatLng(this.windField, lat, lng);
+    const basis = tangentEastNorthAtNormal(px, py, pz);
+
+    let vx = uEastMs * basis.ex + vNorthMs * basis.northX;
+    let vy = uEastMs * basis.ey + vNorthMs * basis.northY;
+    let vz = uEastMs * basis.ez + vNorthMs * basis.northZ;
+    let maxVortexWeight = 0;
+    let maxVorticityScale = 0;
+    let dominantAngleRad = 0.05;
+
+    for (let c = 0; c < this.cyclones.length; c++) {
+      const cyc = this.cyclones[c];
+      if (!samplePreparedCycloneAtNormal(cyc, px, py, pz, this.scratchCyclone)) {
+        continue;
+      }
+      const w = this.scratchCyclone.blendWeight;
+      vx = vx * (1 - w) + this.scratchCyclone.vx;
+      vy = vy * (1 - w) + this.scratchCyclone.vy;
+      vz = vz * (1 - w) + this.scratchCyclone.vz;
+      if (w > maxVortexWeight) {
+        maxVortexWeight = w;
+        dominantAngleRad = cyc.nominalAngleRad;
+      }
+      if (this.scratchCyclone.vorticityScale > maxVorticityScale) {
+        maxVorticityScale = this.scratchCyclone.vorticityScale;
+      }
+    }
+
+    out.vx = vx;
+    out.vy = vy;
+    out.vz = vz;
+    out.speedMs = Math.hypot(vx, vy, vz);
+    out.vortexWeight = maxVortexWeight;
+    out.vorticityScale = maxVorticityScale;
+    out.cycloneAngleRad = dominantAngleRad;
+    return out;
+  }
+
+  private advectParticle(i: number, dtSec: number, advectScale: number) {
     this.age[i] += dtSec;
     let curX = this.nx[i];
     let curY = this.ny[i];
@@ -227,27 +364,70 @@ export class GlobeWindParticleLayer {
       return;
     }
 
-    const lat = Math.asin(clamp(curY, -1, 1)) * RAD_TO_DEG;
-    const lng = Math.atan2(-curZ, curX) * RAD_TO_DEG;
+    const s1 = this.sampleTangentVelocityAtNormal(curX, curY, curZ, this.velScratch1);
+    this.particleSpeedMs[i] = s1.speedMs;
+    this.particleVortexBlend[i] = Math.round(clamp(s1.vortexWeight, 0, 1) * 255);
 
-    const { uEastMs, vNorthMs, speedMs } = sampleWindFieldAtLatLng(this.windField, lat, lng);
-    this.particleSpeedMs[i] = speedMs;
+    const effectiveScale = advectScale;
+    const inVortex = s1.vortexWeight > 0.04;
 
-    const basis = tangentEastNorthAtNormal(curX, curY, curZ);
+    if (inVortex) {
+      // Multi-substep RK2 midpoint advection inside vortices scales angular step clamping
+      // to each cyclone's real spherical radius (nominalAngleRad) and dynamic vorticityScale.
+      const subSteps = s1.vorticityScale > 1.35 ? 3 : 2;
+      const subDt = dtSec / subSteps;
+      const maxSubStepRad = clamp(s1.cycloneAngleRad * 0.22, 0.006, 0.016);
 
-    const effectiveScale = 0.0078 * altFactor;
-    const minAdvectRatio = speedMs > 0.05 && speedMs < 3.0 ? 3.0 / speedMs : 1.0;
-    const vx = (uEastMs * basis.ex + vNorthMs * basis.northX) * minAdvectRatio;
-    const vy = (uEastMs * basis.ey + vNorthMs * basis.northY) * minAdvectRatio;
-    const vz = (uEastMs * basis.ez + vNorthMs * basis.northZ) * minAdvectRatio;
+      for (let step = 0; step < subSteps; step++) {
+        const k1 =
+          step === 0
+            ? s1
+            : this.sampleTangentVelocityAtNormal(curX, curY, curZ, this.velScratch1);
+        const visualSpeed1 = k1.speedMs > 34 ? 34 + (k1.speedMs - 34) * 0.25 : k1.speedMs;
+        const vortGain1 = clamp(0.78 + (k1.vorticityScale - 0.6) * 0.24, 0.72, 1.32);
+        let scale1 =
+          k1.speedMs > 1e-4 ? (visualSpeed1 / k1.speedMs) * effectiveScale * 0.72 * vortGain1 : 0;
+        const disp1 = k1.speedMs * scale1 * subDt;
+        if (disp1 > maxSubStepRad && disp1 > 1e-6) {
+          scale1 *= maxSubStepRad / disp1;
+        }
 
-    curX += vx * effectiveScale * dtSec;
-    curY += vy * effectiveScale * dtSec;
-    curZ += vz * effectiveScale * dtSec;
-    const invLen = 1 / Math.max(1e-7, Math.hypot(curX, curY, curZ));
-    curX *= invLen;
-    curY *= invLen;
-    curZ *= invLen;
+        let mx = curX + k1.vx * scale1 * subDt * 0.5;
+        let my = curY + k1.vy * scale1 * subDt * 0.5;
+        let mz = curZ + k1.vz * scale1 * subDt * 0.5;
+        const mInv = 1 / Math.max(1e-7, Math.hypot(mx, my, mz));
+        mx *= mInv;
+        my *= mInv;
+        mz *= mInv;
+
+        const k2 = this.sampleTangentVelocityAtNormal(mx, my, mz, this.velScratch2);
+        const visualSpeed2 = k2.speedMs > 34 ? 34 + (k2.speedMs - 34) * 0.25 : k2.speedMs;
+        const vortGain2 = clamp(0.78 + (k2.vorticityScale - 0.6) * 0.24, 0.72, 1.32);
+        let scale2 =
+          k2.speedMs > 1e-4 ? (visualSpeed2 / k2.speedMs) * effectiveScale * 0.72 * vortGain2 : 0;
+        const disp2 = k2.speedMs * scale2 * subDt;
+        if (disp2 > maxSubStepRad && disp2 > 1e-6) {
+          scale2 *= maxSubStepRad / disp2;
+        }
+
+        curX += k2.vx * scale2 * subDt;
+        curY += k2.vy * scale2 * subDt;
+        curZ += k2.vz * scale2 * subDt;
+        const invLen = 1 / Math.max(1e-7, Math.hypot(curX, curY, curZ));
+        curX *= invLen;
+        curY *= invLen;
+        curZ *= invLen;
+      }
+    } else {
+      const minAdvectRatio = s1.speedMs > 0.05 && s1.speedMs < 3.0 ? 3.0 / s1.speedMs : 1.0;
+      curX += s1.vx * minAdvectRatio * effectiveScale * dtSec;
+      curY += s1.vy * minAdvectRatio * effectiveScale * dtSec;
+      curZ += s1.vz * minAdvectRatio * effectiveScale * dtSec;
+      const invLen = 1 / Math.max(1e-7, Math.hypot(curX, curY, curZ));
+      curX *= invLen;
+      curY *= invLen;
+      curZ *= invLen;
+    }
 
     this.nx[i] = curX;
     this.ny[i] = curY;
@@ -265,10 +445,15 @@ export class GlobeWindParticleLayer {
     this.spineZ[baseSpine + SPINE_POINTS - 1] = curZ;
   }
 
-  private warmupStreamlines(steps: number, altFactor = 1.0) {
+  private warmupStreamlines(
+    steps: number,
+    advectScale = computeWindAdvectionScale(this.lastAltitude),
+    onlyVortex = false
+  ) {
     for (let s = 0; s < steps; s++) {
       for (let i = 0; i < PARTICLE_COUNT; i++) {
-        this.advectParticle(i, 0.035, altFactor);
+        if (onlyVortex && this.particleVortexIdx[i] < 0) continue;
+        this.advectParticle(i, 0.035, advectScale);
       }
     }
   }
@@ -284,6 +469,8 @@ export class GlobeWindParticleLayer {
       const [cr, cg, cb] = windSpeedToColorRGB(speedMs, this.referenceMaxMs);
       const lifeRatio = clamp(this.age[i] / Math.max(0.1, this.maxAge[i]), 0, 1);
       const lifeFade = Math.pow(Math.sin(lifeRatio * Math.PI), 0.65);
+      const vortexFade = this.particleVortexBlend[i] / 255;
+      const particleHalfWidth = baseHalfWidth * (1 - 0.36 * vortexFade);
       const radius = this.globeRadius + 0.082 + clamp(speedMs / this.referenceMaxMs, 0, 1) * 0.052;
 
       for (let j = 0; j < SPINE_POINTS; j++) {
@@ -320,7 +507,7 @@ export class GlobeWindParticleLayer {
               tNorm < 0.82
                 ? Math.pow(tNorm / 0.82, 0.7)
                 : 1.0 - ((tNorm - 0.82) / 0.18) * 0.52;
-            const hw = (baseHalfWidth * taper) / bLen;
+            const hw = (particleHalfWidth * taper) / bLen;
             sideX = bx * hw;
             sideY = by * hw;
             sideZ = bz * hw;
@@ -379,9 +566,35 @@ export class GlobeWindParticleLayer {
     }
     this.lastFieldSignature = signature;
     this.windField = field;
-    this.referenceMaxMs = Math.max(18.0, (field.metrics.maxSpeedKmh || 65) / 3.6);
+    this.recomputeReferenceMaxMs();
     this.initParticles();
-    this.warmupStreamlines(16, clamp(this.lastAltitude / 11.0, 0.36, 1.18));
+    this.warmupStreamlines(16, computeWindAdvectionScale(this.lastAltitude));
+    this.rebuildRibbonGeometry(this.lastAltitude);
+  }
+
+  public setCyclones(events: readonly GlobalEvent[]) {
+    const specs = extractCycloneVorticesFromEvents(events);
+    let sig = '';
+    for (let i = 0; i < specs.length; i++) {
+      const c = specs[i];
+      sig += `${c.id}:${c.lat.toFixed(2)},${c.lng.toFixed(2)}:${Math.round(c.radiusKm)}:${Math.round(c.maxWindMs * 10)}:${c.centralPressureHpa}:${c.cycloneCategory}:${Math.round(c.vorticityScale * 100)}|`;
+    }
+    if (sig === this.lastCyclonesSignature) {
+      return;
+    }
+    this.lastCyclonesSignature = sig;
+    this.cyclones = prepareCycloneVortices(specs);
+    this.recomputeReferenceMaxMs();
+    this.assignVortexSlots();
+
+    if (this.cyclones.length > 0) {
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        if (this.particleVortexIdx[i] >= 0) {
+          this.respawnParticle(i, true);
+        }
+      }
+      this.warmupStreamlines(14, computeWindAdvectionScale(this.lastAltitude), true);
+    }
     this.rebuildRibbonGeometry(this.lastAltitude);
   }
 
@@ -407,13 +620,14 @@ export class GlobeWindParticleLayer {
     this.focusY = focusY;
     this.focusZ = focusZ;
 
+    const advectScale = computeWindAdvectionScale(altitude);
     const isRegional = altitude < 8.5;
     if (isRegional && (!this.wasRegionalZoom || focusMoved)) {
       this.wasRegionalZoom = true;
       for (let i = 0; i < PARTICLE_COUNT; i++) {
-        if (i % 9 < 4) this.respawnParticle(i, true);
+        if (this.particleVortexIdx[i] < 0 && i % 9 < 4) this.respawnParticle(i, true);
       }
-      this.warmupStreamlines(12, clamp(altitude / 11.0, 0.36, 1.18));
+      this.warmupStreamlines(12, advectScale);
     } else if (!isRegional) {
       this.wasRegionalZoom = false;
     }
@@ -422,10 +636,9 @@ export class GlobeWindParticleLayer {
     this.material.uniforms.uGlobalOpacity.value = 0.95 * closeFade;
 
     const dt = clamp(deltaSec, 0.014, 0.055);
-    const altFactor = clamp(altitude / 11.0, 0.36, 1.18);
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
-      this.advectParticle(i, dt, altFactor);
+      this.advectParticle(i, dt, advectScale);
     }
     this.rebuildRibbonGeometry(altitude);
   }
@@ -435,3 +648,4 @@ export class GlobeWindParticleLayer {
     this.material.dispose();
   }
 }
+

@@ -10,6 +10,7 @@ export interface GodsEyeShaderUniforms {
   horizonFadeRadius: { value: number };
   time: { value: number };
   focusPoint: { value: THREE.Vector3 };
+  edgeColor?: { value: THREE.Color };
 }
 
 export interface Tier1MaskShaderBinding {
@@ -45,7 +46,7 @@ export function applyGodsEyeTerrainShader(
     shader.uniforms.uHorizonFadeRadius = uniforms.horizonFadeRadius;
     shader.uniforms.uTime = uniforms.time;
     shader.uniforms.uFocusPoint = uniforms.focusPoint;
-    shader.uniforms.uEdgeColor = { value: new THREE.Color('#06090f') };
+    shader.uniforms.uEdgeColor = uniforms.edgeColor ?? { value: new THREE.Color('#06090f') };
     shader.uniforms.uHasTier1Mask = { value: tier1Mask ? tier1Mask.hasMask : 0.0 };
     shader.uniforms.uTier1MaskTex = tier1Mask ? tier1Mask.maskTexUniform : DEFAULT_MASK_TEX;
     shader.uniforms.uTier1OriginXZ = tier1Mask ? tier1Mask.originXZ : DEFAULT_ORIGIN_XZ;
@@ -104,9 +105,10 @@ export function applyGodsEyeTerrainShader(
             }
           }
         }
-        // Slope & ridge shading across ALL texture modes so valleys & cliffs have crisp volume
+        // Slope & elevation micro-relief shading across ALL modes so valleys, ridges & cliffs read cleanly
         float slopeSteep = clamp(1.0 - abs(vGeoNormal.y), 0.0, 1.0);
-        diffuseColor.rgb *= mix(1.0, 0.78, smoothstep(0.14, 0.68, slopeSteep));
+        float elevTint = clamp(vGeoWorldPos.y * 0.009, -0.05, 0.09);
+        diffuseColor.rgb *= mix(1.0 + elevTint, 0.76, smoothstep(0.14, 0.68, slopeSteep));
 
         if (uGodsEyeMode > 0.05) {
           float luma = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
@@ -266,19 +268,22 @@ export function applyGodsEyeBuildingShader(
         float fy = fract(scaledPos.y * floorScale);
         float fx = fract((scaledPos.x * 0.73 + scaledPos.z * 0.68) * bayScale);
 
-        // Rooftop architectural texture + mechanical penthouses
+        // Crisp rooftop mechanical penthouses & sunlit upper cornice contrast
         float roofCell = archHash21(floor(scaledPos.xz * 6.5));
         float roofMicro = archHash21(floor(scaledPos.xz * 22.0));
         float roofUnit = smoothstep(0.84, 0.94, roofCell);
-        vec3 roofBaseTint = mix(vec3(0.48, 0.51, 0.56), vec3(0.64, 0.66, 0.70), roofMicro * 0.65);
-        roofBaseTint = mix(roofBaseTint, vec3(0.32, 0.36, 0.42), roofUnit * 0.62);
+        vec3 roofBaseTint = mix(vec3(0.54, 0.57, 0.62), vec3(0.70, 0.73, 0.77), roofMicro * 0.65);
+        roofBaseTint = mix(roofBaseTint, vec3(0.36, 0.40, 0.46), roofUnit * 0.60);
         diffuseColor.rgb *= mix(vec3(1.0), roofBaseTint, roofMask);
 
         float winY = smoothstep(0.16, 0.30, fy) * (1.0 - smoothstep(0.76, 0.88, fy));
         float winX = smoothstep(0.14, 0.26, fx) * (1.0 - smoothstep(0.76, 0.88, fx));
         float windowBay = winX * winY * wallMask;
 
-        float floorShade = mix(0.90, 1.05, smoothstep(0.0, 0.14, fract(scaledPos.y * 0.65)));
+        // Ground-contact AO darkening + vertical sun-bounce gradient + crisp spandrel ribs
+        float vertRel = clamp((vArchWorldPos.y - uFocusPoint.y + 0.4) * 0.45, 0.0, 1.0);
+        float contactAO = mix(0.82, 1.04, smoothstep(0.0, 0.55, vertRel));
+        float floorShade = mix(0.88, 1.06, smoothstep(0.0, 0.14, fract(scaledPos.y * 0.65))) * contactAO;
         float spandrelBand = 1.0 - smoothstep(0.0, 0.14, fy);
         float dayShade = mix(floorShade, mix(0.42, 0.30, uIsHighRise), windowBay);
         dayShade *= mix(1.0, 0.84, spandrelBand * wallMask * uIsHighRise);
@@ -370,7 +375,7 @@ export function applyRoadNetworkShader(
   material: THREE.MeshStandardMaterial,
   uniforms: Pick<
     GodsEyeShaderUniforms,
-    'nightMode' | 'godsEyeMode' | 'horizonFadeRadius' | 'focusPoint' | 'time'
+    'nightMode' | 'godsEyeMode' | 'horizonFadeRadius' | 'focusPoint' | 'time' | 'edgeColor'
   >
 ): void {
   material.onBeforeCompile = (shader) => {
@@ -379,7 +384,7 @@ export function applyRoadNetworkShader(
     shader.uniforms.uHorizonFadeRadius = uniforms.horizonFadeRadius;
     shader.uniforms.uFocusPoint = uniforms.focusPoint;
     shader.uniforms.uTime = uniforms.time;
-    shader.uniforms.uEdgeColor = { value: new THREE.Color('#06090f') };
+    shader.uniforms.uEdgeColor = uniforms.edgeColor ?? { value: new THREE.Color('#06090f') };
 
     shader.vertexShader = shader.vertexShader
       .replace(

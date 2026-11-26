@@ -7,6 +7,7 @@ import {
   useMap,
 } from '@vis.gl/react-google-maps';
 import { Crosshair, Globe2, Minus, Plus } from 'lucide-react';
+import { normalizeLngDeg } from '../shared/geo.ts';
 import type { GlobalEvent, PredictiveRouteResult, SectorPreset } from '../shared/types.ts';
 import { isEsriPlaceholderImage } from '../three/worldTiles.ts';
 
@@ -274,13 +275,16 @@ function InteractiveKeyFreeMap({
         }
 
         if ((layer === 'satelite' && zoom <= 17) || layer === 'nocturno') {
-          const refUrl =
-            layer === 'satelite'
-              ? `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${zoom}/${ty}/${wrappedTx}`
-              : `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/${fetchZoom}/${srcTy}/${srcTx}`;
-          const refRes = requestTile(`ref-${layer}:${fetchZoom}/${srcTx}/${srcTy}`, refUrl);
+          const isSat = layer === 'satelite';
+          const refZoom = isSat ? zoom : fetchZoom;
+          const refTx = isSat ? wrappedTx : srcTx;
+          const refTy = isSat ? ty : srcTy;
+          const refUrl = isSat
+            ? `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${refZoom}/${refTy}/${refTx}`
+            : `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/${refZoom}/${refTy}/${refTx}`;
+          const refRes = requestTile(`ref-${layer}:${refZoom}/${refTx}/${refTy}`, refUrl);
           if (refRes instanceof HTMLImageElement) {
-            if (scaleDiff > 0) {
+            if (!isSat && scaleDiff > 0) {
               const subW = refRes.width / factor;
               const subH = refRes.height / factor;
               const sx = (wrappedTx % factor) * subW;
@@ -401,7 +405,7 @@ function InteractiveKeyFreeMap({
       const nextWy = latToWorldY(prev.lat, zoom) - dy;
       return {
         lat: Math.max(-84, Math.min(84, worldYToLat(nextWy, zoom))),
-        lng: ((worldXToLng(nextWx, zoom) + 540) % 360) - 180,
+        lng: normalizeLngDeg(worldXToLng(nextWx, zoom)),
       };
     });
   };

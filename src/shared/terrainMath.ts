@@ -1,5 +1,5 @@
 import { clamp, haversineKm, latToTileY, lngToTileX, tileXToLng, tileYToLat } from './geo.ts';
-import type { QualityTier } from './types.ts';
+import type { QualityTier, TerrainWaterFeature } from './types.ts';
 
 export interface TerrainTileWindow {
   zoom: number;
@@ -547,4 +547,127 @@ export function despikeElevationGrid(elevationsM: number[], rows: number, cols: 
 
   return out;
 }
+
+/**
+ * Ray-casting 2D point-in-polygon test in normalized [u, v] tile coordinates.
+ */
+export function isPointInPolygon2D(u: number, v: number, ring: Array<[number, number]>): boolean {
+  if (ring.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0];
+    const yi = ring[i][1];
+    const xj = ring[j][0];
+    const yj = ring[j][1];
+    const intersects = (yi > v) !== (yj > v) && u < ((xj - xi) * (v - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Tests whether (u, v) lies inside an MVT polygon's outer ring while excluding any interior island holes.
+ */
+export function isPointInWaterFeatureRings(
+  u: number,
+  v: number,
+  rings: Array<Array<[number, number]>>
+): boolean {
+  if (rings.length === 0 || !isPointInPolygon2D(u, v, rings[0])) {
+    return false;
+  }
+  for (let h = 1; h < rings.length; h++) {
+    if (isPointInPolygon2D(u, v, rings[h])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Returns true if (u, v) falls inside any MVT 'ocean' polygon in the tile.
+ */
+export function isPointInOceanWaterFeatures(
+  u: number,
+  v: number,
+  waterFeatures: TerrainWaterFeature[]
+): boolean {
+  for (let i = 0; i < waterFeatures.length; i++) {
+    const wf = waterFeatures[i];
+    if (wf.isPolygon && wf.kind === 'ocean' && isPointInWaterFeatureRings(u, v, wf.rings)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Depresses shoreline/channel DEM vertices that fall inside crisp MVT 'ocean' polygons when
+ * coarse 30m Terrarium DSM/DEM smears adjacent seawalls/hills above sea level (e.g. +0.7m..+3.5m
+ * inside narrow harbor channels and pier slips), while preserving real coastal cliffs (> maxCarveElevM).
+ */
+export function carveCoastalWaterElevations(
+  elevationsM: number[],
+  rows: number,
+  cols: number,
+  waterFeatures: TerrainWaterFeature[],
+  maxCarveElevM = 32.0,
+  carvedDepthM = -4.5
+): number[] {
+  if (rows < 2 || cols < 2 || elevationsM.length < rows * cols) return elevationsM;
+  const oceanPolys = waterFeatures.filter((wf) => wf.isPolygon && wf.kind === 'ocean' && wf.rings.length > 0);
+  if (oceanPolys.length === 0) return elevationsM;
+
+  const inOcean = new Uint8Array(rows * cols);
+  const out = [...elevationsM];
+  for (let r = 0; r < rows; r++) {
+    const v = r / (rows - 1);
+    for (let c = 0; c < cols; c++) {
+      const idx = r * cols + c;
+      const u = c / (cols - 1);
+      for (let k = 0; k < oceanPolys.length; k++) {
+        if (isPointInWaterFeatureRings(u, v, oceanPolys[k].rings)) {
+          inOcean[idx] = 1;
+          const elev = out[idx] ?? 0;
+          if (elev <= maxCarveElevM && elev > carvedDepthM) {
+            out[idx] = Math.min(elev, carvedDepthM);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // Soften 1-ring low coastal seawall/quay/pier vertices (0.5m..7.5m smeared by 30m Terrarium DSM)
+  // immediately adjacent to carved ocean cells so interpolated terrain triangles do not poke above seaY inside narrow slips.
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const idx = r * cols + c;
+      if (inOcean[idx]) continue;
+      const elev = out[idx] ?? 0;
+      if (elev <= 1.2 || elev > 7.5) continue;
+
+      let touchesOcean = false;
+      for (let dr = -1; dr <= 1 && !touchesOcean; dr++) {
+        const rr = r + dr;
+        if (rr < 0 || rr >= rows) continue;
+        for (let dc = -1; dc <= 1; dc++) {
+          if (dr === 0 && dc === 0) continue;
+          const cc = c + dc;
+          if (cc < 0 || cc >= cols) continue;
+          if (inOcean[rr * cols + cc]) {
+            touchesOcean = true;
+            break;
+          }
+        }
+      }
+      if (touchesOcean) {
+        out[idx] = Number((1.2 + (elev - 1.2) * 0.25).toFixed(1));
+      }
+    }
+  }
+
+  return out;
+}
+
 

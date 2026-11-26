@@ -14,6 +14,11 @@ export function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }
 
+export function normalizeLngDeg(lng: number): number {
+  if (!Number.isFinite(lng)) return 0;
+  return ((((lng + 180) % 360) + 360) % 360) - 180;
+}
+
 /**
  * Converts latitude/longitude (degrees) to right-handed Y-up 3D Cartesian coordinates.
  * Matches Three.js SphereGeometry standard equirectangular UV mapping.

@@ -11,6 +11,7 @@ import type {
 interface PendingJob {
   resolve: (res: ChunkGeometryBuildOutput) => void;
   reject: (err: unknown) => void;
+  slotIdx: number;
 }
 
 /**
@@ -20,6 +21,7 @@ interface PendingJob {
 export class TerrainGeometryWorkerPool {
   private workers: Worker[] = [];
   private workerLoads: number[] = [];
+  private slotJobs: Array<Set<number>> = [];
   private pending = new Map<number, PendingJob>();
   private nextJobId = 1;
   private disposed = false;
@@ -34,8 +36,10 @@ export class TerrainGeometryWorkerPool {
           { type: 'module' }
         );
         const slotIdx = this.workers.length;
+        const jobSet = new Set<number>();
         w.onmessage = (ev: MessageEvent<WorkerGeometryResponse>) => {
           this.workerLoads[slotIdx] = Math.max(0, (this.workerLoads[slotIdx] ?? 1) - 1);
+          jobSet.delete(ev.data.jobId);
           const job = this.pending.get(ev.data.jobId);
           if (job) {
             this.pending.delete(ev.data.jobId);
@@ -43,10 +47,20 @@ export class TerrainGeometryWorkerPool {
           }
         };
         w.onerror = () => {
-          this.workerLoads[slotIdx] = Math.max(0, (this.workerLoads[slotIdx] ?? 1) - 1);
+          const failedIds = Array.from(jobSet);
+          jobSet.clear();
+          this.workerLoads[slotIdx] = 0;
+          for (const id of failedIds) {
+            const job = this.pending.get(id);
+            if (job) {
+              this.pending.delete(id);
+              job.reject(new Error(`Terrain geometry worker slot ${slotIdx} failed`));
+            }
+          }
         };
         this.workers.push(w);
         this.workerLoads.push(0);
+        this.slotJobs.push(jobSet);
       } catch {
         // Fallback cleanly to main-thread execution
       }
@@ -89,12 +103,14 @@ export class TerrainGeometryWorkerPool {
     this.workerLoads[bestSlot] = (this.workerLoads[bestSlot] ?? 0) + 1;
 
     return new Promise<ChunkGeometryBuildOutput>((resolve, reject) => {
-      this.pending.set(jobId, { resolve, reject });
+      this.pending.set(jobId, { resolve, reject, slotIdx: bestSlot });
+      this.slotJobs[bestSlot]?.add(jobId);
       const msg: WorkerGeometryRequest = { jobId, key, input };
       try {
         this.workers[bestSlot].postMessage(msg);
       } catch {
         this.pending.delete(jobId);
+        this.slotJobs[bestSlot]?.delete(jobId);
         this.workerLoads[bestSlot] = Math.max(0, (this.workerLoads[bestSlot] ?? 1) - 1);
         resolve(buildAllChunkGeometriesRaw(input));
       }
@@ -113,6 +129,10 @@ export class TerrainGeometryWorkerPool {
       });
     }
     this.pending.clear();
+    for (const s of this.slotJobs) {
+      s.clear();
+    }
+    this.slotJobs = [];
     for (const w of this.workers) {
       w.terminate();
     }

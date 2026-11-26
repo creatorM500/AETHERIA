@@ -7,6 +7,7 @@ import {
   tileYToLat,
 } from '../shared/geo.ts';
 import type { GlobeTextureMode } from '../shared/types.ts';
+import { applyRegionalTileTerminatorShader, type GlobeSolarUniforms } from './shaders.ts';
 
 function getTileUrl(mode: GlobeTextureMode, z: number, x: number, y: number): string {
   if (mode === 'satellite' || mode === 'godseye') {
@@ -28,13 +29,36 @@ function getLabelOverlayUrl(mode: GlobeTextureMode, z: number, x: number, y: num
   return null;
 }
 
-function loadCorsImage(url: string): Promise<HTMLImageElement> {
+function loadCorsImage(url: string, timeoutMs = 12_000): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.decoding = 'async';
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`Tile failed: ${url}`));
+    let settled = false;
+    const cleanup = () => {
+      img.onload = null;
+      img.onerror = null;
+      clearTimeout(timer);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      img.src = '';
+      reject(new Error(`Tile timed out: ${url}`));
+    }, timeoutMs);
+    img.onload = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(img);
+    };
+    img.onerror = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error(`Tile failed: ${url}`));
+    };
     img.src = url;
   });
 }
@@ -68,7 +92,23 @@ function applySpectralTintRect(
   }
 }
 
+const MAX_PLANETARY_CANVAS_CACHE = 2;
 const planetaryCanvasCache = new Map<GlobeTextureMode, HTMLCanvasElement>();
+
+function disposeCachedCanvas(canvas: HTMLCanvasElement | undefined) {
+  if (!canvas) return;
+  canvas.width = 0;
+  canvas.height = 0;
+}
+
+function disposeTextureAndCanvas(tex: THREE.Texture | undefined) {
+  if (!tex) return;
+  tex.dispose();
+  const img = tex.image as HTMLCanvasElement | undefined;
+  if (img && typeof HTMLCanvasElement !== 'undefined' && img instanceof HTMLCanvasElement) {
+    disposeCachedCanvas(img);
+  }
+}
 
 let placeholderProbeCanvas: HTMLCanvasElement | null = null;
 let placeholderProbeCtx: CanvasRenderingContext2D | null = null;
@@ -134,6 +174,8 @@ export async function streamPlanetaryTilesIntoCanvas(
 
   const cachedPlanetary = planetaryCanvasCache.get(mode);
   if (cachedPlanetary) {
+    planetaryCanvasCache.delete(mode);
+    planetaryCanvasCache.set(mode, cachedPlanetary);
     ctx.drawImage(cachedPlanetary, 0, 0, canvas.width, canvas.height);
     texture.needsUpdate = true;
     onFrameDirty();
@@ -211,16 +253,26 @@ export async function streamPlanetaryTilesIntoCanvas(
     if (!isCancelled()) {
       await drawTileSet(3);
       if (!isCancelled()) {
+        if (planetaryCanvasCache.size >= MAX_PLANETARY_CANVAS_CACHE) {
+          const oldest = planetaryCanvasCache.keys().next().value;
+          if (oldest) {
+            disposeCachedCanvas(planetaryCanvasCache.get(oldest));
+            planetaryCanvasCache.delete(oldest);
+          }
+        }
+        const snapW = Math.min(2048, w);
+        const snapH = Math.min(1024, h);
         const snapshot = document.createElement('canvas');
-        snapshot.width = w;
-        snapshot.height = h;
-        snapshot.getContext('2d')?.drawImage(canvas, 0, 0);
+        snapshot.width = snapW;
+        snapshot.height = snapH;
+        snapshot.getContext('2d')?.drawImage(canvas, 0, 0, snapW, snapH);
         planetaryCanvasCache.set(mode, snapshot);
       }
     }
   }
 }
 
+const MAX_SECTOR_CANVAS_CACHE = 4;
 const sectorCanvasCache = new Map<string, HTMLCanvasElement>();
 
 /**
@@ -335,9 +387,12 @@ export async function streamSectorTextureIntoCanvas(
   await drawPass(2);
   if (isCancelled()) return;
 
-  if (sectorCanvasCache.size >= 24) {
+  if (sectorCanvasCache.size >= MAX_SECTOR_CANVAS_CACHE) {
     const oldest = sectorCanvasCache.keys().next().value;
-    if (oldest) sectorCanvasCache.delete(oldest);
+    if (oldest) {
+      disposeCachedCanvas(sectorCanvasCache.get(oldest));
+      sectorCanvasCache.delete(oldest);
+    }
   }
   const snapshot = document.createElement('canvas');
   snapshot.width = w;
@@ -346,11 +401,23 @@ export async function streamSectorTextureIntoCanvas(
   sectorCanvasCache.set(cacheKey, snapshot);
 }
 
+const MAX_SINGLE_CHUNK_CANVAS_CACHE = 12;
 const singleChunkCanvasCache = new Map<string, HTMLCanvasElement>();
+
+export function trimTileCanvasCaches() {
+  for (const canvas of sectorCanvasCache.values()) {
+    disposeCachedCanvas(canvas);
+  }
+  sectorCanvasCache.clear();
+  for (const canvas of singleChunkCanvasCache.values()) {
+    disposeCachedCanvas(canvas);
+  }
+  singleChunkCanvasCache.clear();
+}
 
 /**
  * Progressively draws crisp imagery for a SINGLE Mercator terrain chunk (z, tx, ty):
- * - z === 14 + highResSubdivide: z=14 base -> crisp 2x2 z=15 sub-tiles (1024px)
+ * - z === 14 + highResSubdivide: z=14 base -> crisp 2x2 z=15 sub-tiles (512px)
  * - z === 12 + highResSubdivide: z=12 base -> crisp 2x2 z=13 sub-tiles (512px) for sharp 48km mountains
  * - Shares crisp un-washed Esri imagery between 'satellite' & 'godseye' so GLSL handles HDR hologram blending!
  */
@@ -374,6 +441,8 @@ export async function streamSingleTileTextureIntoCanvas(
   const cacheKey = `${effectiveMode}/${z}/${tx}/${ty}/${canvas.width}/${highResSubdivide ? 2 : 1}`;
   const cached = singleChunkCanvasCache.get(cacheKey);
   if (cached) {
+    singleChunkCanvasCache.delete(cacheKey);
+    singleChunkCanvasCache.set(cacheKey, cached);
     ctx.drawImage(cached, 0, 0, canvas.width, canvas.height);
     texture.needsUpdate = true;
     onDirty();
@@ -439,9 +508,12 @@ export async function streamSingleTileTextureIntoCanvas(
   }
 
   if (!isCancelled()) {
-    if (singleChunkCanvasCache.size >= 96) {
+    if (singleChunkCanvasCache.size >= MAX_SINGLE_CHUNK_CANVAS_CACHE) {
       const oldest = singleChunkCanvasCache.keys().next().value;
-      if (oldest) singleChunkCanvasCache.delete(oldest);
+      if (oldest) {
+        disposeCachedCanvas(singleChunkCanvasCache.get(oldest));
+        singleChunkCanvasCache.delete(oldest);
+      }
     }
     const snap = document.createElement('canvas');
     snap.width = canvas.width;
@@ -562,24 +634,34 @@ export class GlobeRegionalTileManager {
   private activeCenterTx = -1;
   private activeCenterTy = -1;
   private activeMode: GlobeTextureMode = 'satellite';
+  private modeEpoch = 0;
   private maxAnisotropy: number;
   private globeRadius: number;
   private onDirty: () => void;
+  private solarUniforms?: GlobeSolarUniforms;
 
-  constructor(globeRadius: number, maxAnisotropy: number, onDirty: () => void) {
+  constructor(
+    globeRadius: number,
+    maxAnisotropy: number,
+    onDirty: () => void,
+    solarUniforms?: GlobeSolarUniforms
+  ) {
     this.globeRadius = globeRadius;
     this.maxAnisotropy = maxAnisotropy;
     this.onDirty = onDirty;
+    this.solarUniforms = solarUniforms;
   }
 
   public setMode(mode: GlobeTextureMode) {
     if (this.activeMode === mode) return;
     this.activeMode = mode;
+    this.modeEpoch += 1;
     this.clearAllMeshes();
     for (const tex of this.textureCache.values()) {
-      tex.dispose();
+      disposeTextureAndCanvas(tex);
     }
     this.textureCache.clear();
+    this.rawParentCache.clear();
     this.loadingKeys.clear();
     this.pendingQueue = [];
     this.queuedKeys.clear();
@@ -772,6 +854,8 @@ export class GlobeRegionalTileManager {
       if (this.activeMeshes.has(spec.key)) continue;
       const cachedTex = this.textureCache.get(spec.key);
       if (cachedTex) {
+        this.textureCache.delete(spec.key);
+        this.textureCache.set(spec.key, cachedTex);
         this.attachTileMesh(spec, cachedTex);
       } else if (!this.loadingKeys.has(spec.key) && !this.queuedKeys.has(spec.key)) {
         this.pendingQueue.push(spec);
@@ -797,7 +881,7 @@ export class GlobeRegionalTileManager {
       if (this.loadingKeys.has(spec.key) || this.activeMeshes.has(spec.key)) continue;
 
       this.loadingKeys.add(spec.key);
-      void this.fetchCompositeTileTexture(this.activeMode, spec);
+      void this.fetchCompositeTileTexture(this.activeMode, spec, this.modeEpoch);
     }
   }
 
@@ -822,9 +906,13 @@ export class GlobeRegionalTileManager {
   ): Promise<HTMLImageElement> {
     const k = `${mode}/${z}/${tx}/${ty}`;
     const cached = this.rawParentCache.get(k);
-    if (cached) return cached;
+    if (cached) {
+      this.rawParentCache.delete(k);
+      this.rawParentCache.set(k, cached);
+      return cached;
+    }
     const img = await loadCorsImage(getTileUrl(mode, z, tx, ty));
-    if (this.rawParentCache.size > 64) {
+    if (this.rawParentCache.size >= 20) {
       const oldest = this.rawParentCache.keys().next().value;
       if (oldest) this.rawParentCache.delete(oldest);
     }
@@ -832,9 +920,15 @@ export class GlobeRegionalTileManager {
     return img;
   }
 
-  private async fetchCompositeTileTexture(mode: GlobeTextureMode, spec: DesiredTileSpec) {
+  private async fetchCompositeTileTexture(
+    mode: GlobeTextureMode,
+    spec: DesiredTileSpec,
+    epoch: number
+  ) {
     try {
       const baseImg = await loadCorsImage(getTileUrl(mode, spec.zoom, spec.tx, spec.ty));
+      if (epoch !== this.modeEpoch) return;
+
       let resolvedImg: HTMLImageElement = baseImg;
       let cropDz = 0;
 
@@ -845,6 +939,7 @@ export class GlobeRegionalTileManager {
           const pty = spec.ty >> dz;
           try {
             const parentImg = await this.loadRawParent(mode, pz, ptx, pty);
+            if (epoch !== this.modeEpoch) return;
             if (!isEsriPlaceholderImage(parentImg)) {
               resolvedImg = parentImg;
               cropDz = dz;
@@ -861,10 +956,13 @@ export class GlobeRegionalTileManager {
       if (labelUrl) {
         try {
           labelImg = await loadCorsImage(labelUrl);
+          if (epoch !== this.modeEpoch) return;
         } catch {
           labelImg = null;
         }
       }
+
+      if (epoch !== this.modeEpoch) return;
 
       let tex: THREE.Texture;
       if (mode !== 'thermal' && mode !== 'godseye' && cropDz === 0 && !labelImg) {
@@ -900,11 +998,10 @@ export class GlobeRegionalTileManager {
       tex.anisotropy = this.maxAnisotropy;
       tex.needsUpdate = true;
 
-      if (this.textureCache.size > 380) {
+      if (this.textureCache.size >= 96) {
         const oldestKey = this.textureCache.keys().next().value;
         if (oldestKey) {
-          const old = this.textureCache.get(oldestKey);
-          old?.dispose();
+          disposeTextureAndCanvas(this.textureCache.get(oldestKey));
           this.textureCache.delete(oldestKey);
         }
       }
@@ -919,9 +1016,13 @@ export class GlobeRegionalTileManager {
         this.onDirty();
       }
     } catch {
-      this.loadingKeys.delete(spec.key);
+      if (epoch === this.modeEpoch) {
+        this.loadingKeys.delete(spec.key);
+      }
     } finally {
-      this.pumpQueue();
+      if (epoch === this.modeEpoch) {
+        this.pumpQueue();
+      }
     }
   }
 
@@ -951,6 +1052,9 @@ export class GlobeRegionalTileManager {
             ...commonOffset,
             toneMapped: false,
           });
+    if (mat instanceof THREE.MeshStandardMaterial && this.solarUniforms) {
+      applyRegionalTileTerminatorShader(mat, this.solarUniforms);
+    }
     const mesh = new THREE.Mesh(geometry, mat);
     mesh.position.copy(center);
     mesh.renderOrder = spec.renderOrder;
@@ -959,11 +1063,13 @@ export class GlobeRegionalTileManager {
   }
 
   public dispose() {
+    this.modeEpoch += 1;
     this.clearAllMeshes();
     for (const tex of this.textureCache.values()) {
-      tex.dispose();
+      disposeTextureAndCanvas(tex);
     }
     this.textureCache.clear();
+    this.rawParentCache.clear();
     this.loadingKeys.clear();
     this.pendingQueue = [];
     this.queuedKeys.clear();

@@ -9,11 +9,23 @@ import {
   latLngToCartesian,
   latToTileY,
   lngToTileX,
+  normalizeLngDeg,
   routeSpanToGlobeDistance,
   sampleTerrainElevation,
   tileXToLng,
   tileYToLat,
 } from './geo.ts';
+
+test('normalizeLngDeg wraps arbitrary multi-turn longitudes and guards non-finite inputs', () => {
+  assert.equal(normalizeLngDeg(0), 0);
+  assert.equal(normalizeLngDeg(190), -170);
+  assert.equal(normalizeLngDeg(-541), 179);
+  assert.equal(normalizeLngDeg(545), -175);
+  assert.equal(normalizeLngDeg(-180), -180);
+  assert.equal(normalizeLngDeg(180), -180);
+  assert.equal(normalizeLngDeg(Number.NaN), 0);
+  assert.equal(normalizeLngDeg(Number.POSITIVE_INFINITY), 0);
+});
 
 test('latLngToCartesian and cartesianToLatLng round-trip accurately', () => {
   const samples = [

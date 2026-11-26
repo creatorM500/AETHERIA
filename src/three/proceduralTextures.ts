@@ -84,27 +84,47 @@ const CONTINENT_POLYGONS: Array<Array<[number, number]>> = [
 const URBAN_HUBS: Array<[number, number, number]> = [
   [-99.13, 19.43, 1.0], // CDMX
   [-74.0, 40.71, 1.0],  // NYC
-  [-118.24, 34.05, 0.9], // LA
-  [-87.62, 41.87, 0.8], // Chicago
-  [-46.63, -23.55, 0.95], // Sao Paulo
-  [-58.38, -34.6, 0.8], // Buenos Aires
+  [-118.24, 34.05, 0.92], // LA
+  [-87.62, 41.87, 0.85], // Chicago
+  [-95.36, 29.76, 0.85], // Houston
+  [-80.19, 25.76, 0.85], // Miami
+  [-79.38, 43.65, 0.82], // Toronto
+  [-46.63, -23.55, 0.96], // Sao Paulo
+  [-43.17, -22.90, 0.88], // Rio
+  [-58.38, -34.6, 0.86], // Buenos Aires
+  [-74.07, 4.71, 0.82],  // Bogota
+  [-77.04, -12.04, 0.78], // Lima
+  [-70.66, -33.44, 0.8], // Santiago
   [-0.12, 51.5, 1.0],   // London
-  [2.35, 48.85, 0.95],  // Paris
-  [-3.7, 40.41, 0.85],  // Madrid
-  [13.4, 52.52, 0.8],   // Berlin
-  [37.61, 55.75, 0.9],  // Moscow
-  [31.23, 30.04, 0.9],  // Cairo
-  [3.37, 6.52, 0.8],    // Lagos
-  [55.27, 25.2, 0.9],   // Dubai
-  [72.87, 19.07, 0.95], // Mumbai
-  [77.2, 28.61, 0.95],  // Delhi
-  [103.82, 1.35, 0.9],  // Singapore
+  [2.35, 48.85, 0.96],  // Paris
+  [-3.7, 40.41, 0.88],  // Madrid
+  [9.19, 45.46, 0.86],  // Milan
+  [12.49, 41.90, 0.82], // Rome
+  [13.4, 52.52, 0.84],  // Berlin
+  [28.97, 41.00, 0.92], // Istanbul
+  [37.61, 55.75, 0.94], // Moscow
+  [31.23, 30.04, 0.96], // Cairo
+  [3.37, 6.52, 0.84],   // Lagos
+  [28.04, -26.20, 0.84], // Johannesburg
+  [51.38, 35.68, 0.86], // Tehran
+  [46.67, 24.71, 0.86], // Riyadh
+  [55.27, 25.2, 0.95],  // Dubai
+  [72.87, 19.07, 0.98], // Mumbai
+  [77.2, 28.61, 0.98],  // Delhi
+  [77.59, 12.97, 0.86], // Bengaluru
+  [100.50, 13.75, 0.88], // Bangkok
+  [103.82, 1.35, 0.94], // Singapore
+  [106.84, -6.20, 0.90], // Jakarta
+  [120.98, 14.59, 0.86], // Manila
   [116.4, 39.9, 1.0],   // Beijing
   [121.47, 31.23, 1.0], // Shanghai
-  [114.16, 22.31, 0.95],// HK
+  [114.16, 22.31, 0.98],// HK
+  [121.56, 25.03, 0.90], // Taipei
   [139.69, 35.68, 1.0], // Tokyo
-  [126.97, 37.56, 0.9], // Seoul
-  [151.2, -33.86, 0.85],// Sydney
+  [135.50, 34.69, 0.94], // Osaka
+  [126.97, 37.56, 0.96], // Seoul
+  [151.2, -33.86, 0.88], // Sydney
+  [144.96, -37.81, 0.84], // Melbourne
 ];
 
 function lngToX(lng: number, width: number): number {
@@ -136,8 +156,8 @@ export function createGlobeTextures(
   bumpMap: THREE.CanvasTexture;
   roughnessMap: THREE.CanvasTexture;
 } {
-  const width = highRes ? 4096 : 2048;
-  const height = highRes ? 2048 : 1024;
+  const width = highRes ? 4096 : 1536;
+  const height = highRes ? 2048 : 768;
 
   // 1. Albedo / Dynamic Visual Map
   const colorCanvas = document.createElement('canvas');
@@ -270,34 +290,36 @@ export function createGlobeTextures(
   ctx.lineWidth = (mode === 'thermal' || mode === 'godseye' ? 1.8 : 1.25) * resScale;
   ctx.stroke();
 
-  // Urban Node Clusters / City Lights
-  for (const [lng, lat, intensity] of URBAN_HUBS) {
-    const x = lngToX(lng, width);
-    const y = latToY(lat, height);
-    const r = (mode === 'thermal' || mode === 'godseye' ? 14 : 9) * resScale;
-    const grad = ctx.createRadialGradient(x, y, 0.5, x, y, r);
-    if (mode === 'godseye') {
-      grad.addColorStop(0, `rgba(103, 232, 249, ${0.95 * intensity})`);
-      grad.addColorStop(0.5, `rgba(14, 165, 233, ${0.5 * intensity})`);
-      grad.addColorStop(1, 'rgba(6, 182, 212, 0)');
-    } else if (mode === 'thermal') {
-      grad.addColorStop(0, `rgba(245, 158, 11, ${0.9 * intensity})`);
-      grad.addColorStop(0.5, `rgba(6, 182, 212, ${0.45 * intensity})`);
-      grad.addColorStop(1, 'rgba(6, 182, 212, 0)');
-    } else {
-      grad.addColorStop(0, `rgba(253, 224, 71, ${0.75 * intensity})`);
-      grad.addColorStop(0.5, `rgba(251, 146, 60, ${0.3 * intensity})`);
-      grad.addColorStop(1, 'rgba(251, 146, 60, 0)');
+  // Urban Node Clusters / Tactical Hubs (kept out of daytime 'satellite' so night lights drive city glow)
+  if (mode !== 'satellite') {
+    for (const [lng, lat, intensity] of URBAN_HUBS) {
+      const x = lngToX(lng, width);
+      const y = latToY(lat, height);
+      const r = (mode === 'thermal' || mode === 'godseye' ? 14 : 9) * resScale;
+      const grad = ctx.createRadialGradient(x, y, 0.5, x, y, r);
+      if (mode === 'godseye') {
+        grad.addColorStop(0, `rgba(103, 232, 249, ${0.95 * intensity})`);
+        grad.addColorStop(0.5, `rgba(14, 165, 233, ${0.5 * intensity})`);
+        grad.addColorStop(1, 'rgba(6, 182, 212, 0)');
+      } else if (mode === 'thermal') {
+        grad.addColorStop(0, `rgba(245, 158, 11, ${0.9 * intensity})`);
+        grad.addColorStop(0.5, `rgba(6, 182, 212, ${0.45 * intensity})`);
+        grad.addColorStop(1, 'rgba(6, 182, 212, 0)');
+      } else {
+        grad.addColorStop(0, `rgba(253, 224, 71, ${0.75 * intensity})`);
+        grad.addColorStop(0.5, `rgba(251, 146, 60, ${0.3 * intensity})`);
+        grad.addColorStop(1, 'rgba(251, 146, 60, 0)');
+      }
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
     }
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fill();
   }
 
   // 2. Bump / Relief Map (grayscale linear)
-  const bumpW = highRes ? 2048 : 1024;
-  const bumpH = highRes ? 1024 : 512;
+  const bumpW = highRes ? 1024 : 512;
+  const bumpH = highRes ? 512 : 256;
   const bumpCanvas = document.createElement('canvas');
   bumpCanvas.width = bumpW;
   bumpCanvas.height = bumpH;
@@ -311,15 +333,15 @@ export function createGlobeTextures(
   bCtx.lineWidth = highRes ? 3 : 2;
   bCtx.stroke();
 
-  // 3. Roughness Map (oceans satin 0.58 to avoid harsh glare hotspots, land matte 0.92)
+  // 3. Roughness Map (oceans satin 0.48 for controlled orbital sunglint, land matte 0.91)
   const roughCanvas = document.createElement('canvas');
   roughCanvas.width = bumpW;
   roughCanvas.height = bumpH;
   const rCtx = roughCanvas.getContext('2d')!;
-  rCtx.fillStyle = '#949494';
+  rCtx.fillStyle = '#7a7a7a';
   rCtx.fillRect(0, 0, bumpW, bumpH);
   traceContinents(rCtx, bumpW, bumpH);
-  rCtx.fillStyle = '#ebebeb';
+  rCtx.fillStyle = '#e8e8e8';
   rCtx.fill();
 
   const colorMap = new THREE.CanvasTexture(colorCanvas);
@@ -340,6 +362,259 @@ export function createGlobeTextures(
   roughnessMap.needsUpdate = true;
 
   return { colorMap, bumpMap, roughnessMap };
+}
+
+/**
+ * Generates real global mountain-range bump relief & pixel-accurate ocean/land roughness
+ * from the server's Terrarium planetary DEM grid (`/api/terrain/planet-dem`).
+ */
+export function buildPlanetaryDemTextures(
+  grid: { width: number; height: number; heights01: number[] },
+  maxAnisotropy: number,
+  highRes = true
+): {
+  bumpMap: THREE.CanvasTexture;
+  roughnessMap: THREE.CanvasTexture;
+} {
+  const outW = highRes ? 1024 : 512;
+  const outH = highRes ? 512 : 256;
+  const srcW = grid.width;
+  const srcH = grid.height;
+  const src = grid.heights01;
+
+  const bumpCanvas = document.createElement('canvas');
+  bumpCanvas.width = outW;
+  bumpCanvas.height = outH;
+  const bCtx = bumpCanvas.getContext('2d')!;
+  const bImg = bCtx.createImageData(outW, outH);
+
+  const roughCanvas = document.createElement('canvas');
+  roughCanvas.width = outW;
+  roughCanvas.height = outH;
+  const rCtx = roughCanvas.getContext('2d')!;
+  const rImg = rCtx.createImageData(outW, outH);
+
+  const sampleBilerp = (fx: number, fy: number) => {
+    const x0 = Math.floor(fx);
+    const y0 = Math.floor(fy);
+    const x1 = (x0 + 1) % srcW;
+    const y1 = Math.min(srcH - 1, y0 + 1);
+    const wx = fx - x0;
+    const wy = fy - y0;
+    const h00 = src[y0 * srcW + x0] ?? 0;
+    const h10 = src[y0 * srcW + x1] ?? 0;
+    const h01 = src[y1 * srcW + x0] ?? 0;
+    const h11 = src[y1 * srcW + x1] ?? 0;
+    const top = h00 + (h10 - h00) * wx;
+    const bot = h01 + (h11 - h01) * wx;
+    return top + (bot - top) * wy;
+  };
+
+  for (let y = 0; y < outH; y++) {
+    const fy = (y / (outH - 1)) * (srcH - 1);
+    for (let x = 0; x < outW; x++) {
+      const fx = (x / outW) * srcW;
+      const h = sampleBilerp(fx, fy);
+      // Compress lower elevations slightly so coastal plains remain smooth while mountain cordilleras pop
+      const ridge = Math.pow(Math.min(1, Math.max(0, h)), 0.72);
+      const isLand = h > 0.0018;
+      const bumpVal = isLand ? Math.min(255, Math.round(28 + ridge * 227)) : 8;
+      const roughVal = isLand ? Math.min(255, Math.round(212 + ridge * 38)) : 122;
+
+      const idx = (y * outW + x) * 4;
+      bImg.data[idx] = bumpVal;
+      bImg.data[idx + 1] = bumpVal;
+      bImg.data[idx + 2] = bumpVal;
+      bImg.data[idx + 3] = 255;
+
+      rImg.data[idx] = roughVal;
+      rImg.data[idx + 1] = roughVal;
+      rImg.data[idx + 2] = roughVal;
+      rImg.data[idx + 3] = 255;
+    }
+  }
+
+  bCtx.putImageData(bImg, 0, 0);
+  rCtx.putImageData(rImg, 0, 0);
+
+  const bumpMap = new THREE.CanvasTexture(bumpCanvas);
+  bumpMap.colorSpace = THREE.NoColorSpace;
+  bumpMap.wrapS = THREE.RepeatWrapping;
+  bumpMap.wrapT = THREE.ClampToEdgeWrapping;
+  bumpMap.anisotropy = maxAnisotropy;
+  bumpMap.needsUpdate = true;
+
+  const roughnessMap = new THREE.CanvasTexture(roughCanvas);
+  roughnessMap.colorSpace = THREE.NoColorSpace;
+  roughnessMap.wrapS = THREE.RepeatWrapping;
+  roughnessMap.wrapT = THREE.ClampToEdgeWrapping;
+  roughnessMap.anisotropy = maxAnisotropy;
+  roughnessMap.needsUpdate = true;
+
+  return { bumpMap, roughnessMap };
+}
+
+const NIGHT_URBAN_CORRIDORS: Array<{
+  lng1: number;
+  lat1: number;
+  lng2: number;
+  lat2: number;
+  density: number;
+  spreadDeg: number;
+  intensity: number;
+}> = [
+  // North America
+  { lng1: -77.0, lat1: 38.9, lng2: -71.0, lat2: 42.3, density: 18, spreadDeg: 1.6, intensity: 1.0 },
+  { lng1: -87.6, lat1: 41.8, lng2: -79.4, lat2: 43.6, density: 16, spreadDeg: 2.0, intensity: 0.85 },
+  { lng1: -81.6, lat1: 25.8, lng2: -81.4, lat2: 30.3, density: 12, spreadDeg: 1.2, intensity: 0.8 },
+  { lng1: -98.5, lat1: 29.4, lng2: -95.4, lat2: 32.8, density: 14, spreadDeg: 1.8, intensity: 0.85 },
+  { lng1: -122.4, lat1: 37.8, lng2: -117.1, lat2: 32.7, density: 16, spreadDeg: 1.5, intensity: 0.9 },
+  { lng1: -103.3, lat1: 20.6, lng2: -98.2, lat2: 19.0, density: 14, spreadDeg: 1.4, intensity: 0.9 },
+  { lng1: -100.3, lat1: 25.7, lng2: -97.5, lat2: 26.0, density: 8, spreadDeg: 1.2, intensity: 0.72 },
+  // South America
+  { lng1: -46.7, lat1: -23.5, lng2: -43.2, lat2: -22.9, density: 14, spreadDeg: 1.4, intensity: 0.95 },
+  { lng1: -58.4, lat1: -34.6, lng2: -56.1, lat2: -34.9, density: 10, spreadDeg: 1.2, intensity: 0.82 },
+  { lng1: -75.6, lat1: 6.2, lng2: -74.1, lat2: 4.7, density: 9, spreadDeg: 1.2, intensity: 0.72 },
+  // Europe
+  { lng1: -4.2, lat1: 55.8, lng2: 1.3, lat2: 51.3, density: 18, spreadDeg: 1.5, intensity: 0.95 },
+  { lng1: 2.3, lat1: 48.8, lng2: 10.0, lat2: 53.5, density: 22, spreadDeg: 1.8, intensity: 0.95 },
+  { lng1: 7.6, lat1: 45.1, lng2: 12.5, lat2: 41.9, density: 16, spreadDeg: 1.5, intensity: 0.88 },
+  { lng1: -3.7, lat1: 40.4, lng2: 2.1, lat2: 41.4, density: 12, spreadDeg: 1.4, intensity: 0.8 },
+  { lng1: 13.4, lat1: 52.5, lng2: 21.0, lat2: 52.2, density: 14, spreadDeg: 1.8, intensity: 0.78 },
+  { lng1: 30.3, lat1: 59.9, lng2: 37.6, lat2: 55.7, density: 14, spreadDeg: 1.8, intensity: 0.88 },
+  // Africa & Middle East
+  { lng1: 30.0, lat1: 31.2, lng2: 32.6, lat2: 25.7, density: 18, spreadDeg: 0.9, intensity: 0.96 },
+  { lng1: 34.8, lat1: 32.1, lng2: 36.3, lat2: 33.5, density: 10, spreadDeg: 1.0, intensity: 0.82 },
+  { lng1: 46.7, lat1: 24.7, lng2: 55.3, lat2: 25.2, density: 14, spreadDeg: 1.6, intensity: 0.92 },
+  { lng1: 3.4, lat1: 6.5, lng2: 7.5, lat2: 9.0, density: 10, spreadDeg: 1.4, intensity: 0.72 },
+  { lng1: 28.0, lat1: -26.2, lng2: 28.2, lat2: -25.7, density: 10, spreadDeg: 1.2, intensity: 0.8 },
+  // Asia & Oceania
+  { lng1: 74.3, lat1: 31.5, lng2: 88.3, lat2: 22.6, density: 28, spreadDeg: 1.9, intensity: 0.95 },
+  { lng1: 72.8, lat1: 19.1, lng2: 77.6, lat2: 13.0, density: 16, spreadDeg: 1.6, intensity: 0.85 },
+  { lng1: 114.5, lat1: 38.0, lng2: 121.5, lat2: 31.2, density: 28, spreadDeg: 2.2, intensity: 0.98 },
+  { lng1: 113.2, lat1: 23.1, lng2: 114.2, lat2: 22.3, density: 16, spreadDeg: 1.2, intensity: 1.0 },
+  { lng1: 126.9, lat1: 37.5, lng2: 129.0, lat2: 35.1, density: 14, spreadDeg: 1.1, intensity: 0.95 },
+  { lng1: 135.5, lat1: 34.7, lng2: 139.8, lat2: 35.7, density: 20, spreadDeg: 1.2, intensity: 1.0 },
+  { lng1: 100.5, lat1: 13.7, lng2: 103.8, lat2: 1.35, density: 12, spreadDeg: 1.2, intensity: 0.84 },
+  { lng1: 106.8, lat1: -6.2, lng2: 112.7, lat2: -7.2, density: 14, spreadDeg: 0.9, intensity: 0.86 },
+  { lng1: 144.9, lat1: -37.8, lng2: 151.2, lat2: -33.8, density: 10, spreadDeg: 1.3, intensity: 0.85 },
+];
+
+/**
+ * Generates a dedicated NASA Black Marble-inspired equirectangular urban night-lights texture
+ * with crisp pinpoint metropolitan cores, fine corridor webs, and restrained warm amber halos.
+ */
+export function createNightLightsTexture(highRes = true): THREE.CanvasTexture {
+  const width = highRes ? 4096 : 2048;
+  const height = highRes ? 2048 : 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, width, height);
+
+  // Scale relative to the 2048x1024 baseline so dots remain fine pinpoints at both 2K and 4K
+  const resScale = highRes ? 1.55 : 1.0;
+
+  const drawCityPoint = (
+    lng: number,
+    lat: number,
+    haloPx: number,
+    corePx: number,
+    alpha: number
+  ) => {
+    const x = lngToX(lng, width);
+    const y = latToY(lat, height);
+
+    const grad = ctx.createRadialGradient(x, y, 0, x, y, haloPx);
+    grad.addColorStop(0, `rgba(255, 224, 150, ${Math.min(0.84, alpha * 0.88)})`);
+    grad.addColorStop(0.36, `rgba(245, 142, 42, ${alpha * 0.30})`);
+    grad.addColorStop(1, 'rgba(245, 138, 36, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(x, y, haloPx, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = `rgba(255, 248, 220, ${Math.min(0.98, alpha)})`;
+    ctx.beginPath();
+    ctx.arc(x, y, corePx, 0, Math.PI * 2);
+    ctx.fill();
+  };
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+
+  let seed = 1;
+  const nextRand = () => {
+    const v = Math.sin(seed * 12.9898 + 4.1414) * 43758.5453;
+    seed += 1;
+    return v - Math.floor(v);
+  };
+
+  // Faint capillary highway/rail filaments connecting major urban corridors
+  ctx.lineCap = 'round';
+  for (const c of NIGHT_URBAN_CORRIDORS) {
+    const x1 = lngToX(c.lng1, width);
+    const y1 = latToY(c.lat1, height);
+    const x2 = lngToX(c.lng2, width);
+    const y2 = latToY(c.lat2, height);
+    if (Math.abs(x2 - x1) > width * 0.5) continue;
+    const cx = (x1 + x2) * 0.5 + (nextRand() - 0.5) * 14 * resScale;
+    const cy = (y1 + y2) * 0.5 + (nextRand() - 0.5) * 10 * resScale;
+    ctx.strokeStyle = `rgba(255, 178, 78, ${0.13 * c.intensity})`;
+    ctx.lineWidth = 0.85 * resScale;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.quadraticCurveTo(cx, cy, x2, y2);
+    ctx.stroke();
+  }
+
+  // Primary metropolitan hubs + organic multi-lobe suburban sprawl
+  for (const [lng, lat, intensity] of URBAN_HUBS) {
+    drawCityPoint(lng, lat, 2.75 * resScale, 0.82 * resScale, 0.96 * intensity);
+    for (let s = 0; s < 26; s++) {
+      const ang = (s / 26) * Math.PI * 2 + nextRand() * 0.5;
+      const distDeg = 0.08 + Math.pow(nextRand(), 1.35) * 1.15;
+      drawCityPoint(
+        lng + Math.cos(ang) * distDeg,
+        lat + Math.sin(ang) * (distDeg * 0.72),
+        (0.95 + nextRand() * 0.55) * resScale,
+        (0.28 + nextRand() * 0.22) * resScale,
+        (0.32 + nextRand() * 0.44) * intensity
+      );
+    }
+  }
+
+  // Dense regional urban networks & towns along corridors (no bead-like spacing)
+  for (const c of NIGHT_URBAN_CORRIDORS) {
+    const count = Math.round(c.density * 4.4);
+    for (let i = 0; i < count; i++) {
+      const t = count <= 1 ? 0.5 : i / (count - 1);
+      const jx = (nextRand() - 0.5) * c.spreadDeg;
+      const jy = (nextRand() - 0.5) * (c.spreadDeg * 0.72);
+
+      const lng = c.lng1 + (c.lng2 - c.lng1) * t + jx;
+      const lat = c.lat1 + (c.lat2 - c.lat1) * t + jy;
+      const isTown = i % 4 === 0;
+      const halo = (isTown ? 1.45 : 0.88) * resScale;
+      const core = (isTown ? 0.46 : 0.28) * resScale;
+      const a = c.intensity * (isTown ? 0.68 : 0.42) * (0.65 + nextRand() * 0.35);
+      drawCityPoint(lng, lat, halo, core, a);
+    }
+  }
+  ctx.restore();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.generateMipmaps = true;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
 }
 
 function hash2(x: number, y: number): number {
@@ -366,8 +641,8 @@ function valueNoise2D(x: number, y: number, periodX: number): number {
 }
 
 export function createCloudTexture(highRes = true): THREE.CanvasTexture {
-  const w = highRes ? 1536 : 768;
-  const h = highRes ? 768 : 384;
+  const w = highRes ? 2048 : 1024;
+  const h = highRes ? 1024 : 512;
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
@@ -377,29 +652,37 @@ export function createCloudTexture(highRes = true): THREE.CanvasTexture {
 
   for (let y = 0; y < h; y++) {
     const v = y / h;
-    // Jet stream Coriolis shear by latitude
+    // Jet stream Coriolis shear + tropical ITCZ & mid-latitude storm track belts
     const lat = (0.5 - v) * Math.PI;
-    const shear = Math.sin(lat * 3.0) * 1.65;
-    const bandMask = 0.65 + 0.35 * Math.cos(lat * 2.2);
+    const absLat = Math.abs(lat);
+    const shear = Math.sin(lat * 3.2) * 1.9;
+    const itczBoost = Math.exp(-Math.pow((lat - 0.08) / 0.22, 2)) * 0.14;
+    const stormBelt = Math.exp(-Math.pow((absLat - 0.85) / 0.32, 2)) * 0.12;
+    const drySubtropics = -Math.exp(-Math.pow((absLat - 0.48) / 0.18, 2)) * 0.09;
+    const latEnvelope = 0.82 + itczBoost + stormBelt + drySubtropics;
 
     for (let x = 0; x < w; x++) {
       const u = x / w;
-      const nx = u * 10 + shear * 0.4;
-      const ny = v * 5;
+      const nx = u * 12 + shear * 0.45;
+      const ny = v * 6;
 
-      const warp = valueNoise2D(nx * 1.5, ny * 1.5, 15) * 1.1;
-      const f1 = valueNoise2D(nx + warp, ny + warp * 0.5, 10);
-      const f2 = valueNoise2D(nx * 2 + warp * 1.2, ny * 2, 20) * 0.5;
-      const f3 = valueNoise2D(nx * 4, ny * 4, 40) * 0.25;
-      const f4 = valueNoise2D(nx * 8, ny * 8, 80) * 0.12;
+      // Two-stage domain warp creates realistic swirling synoptic fronts & cirrus wisps
+      const warpX = valueNoise2D(nx * 1.25, ny * 1.25, 15) * 1.45;
+      const warpY = valueNoise2D(nx * 1.25 + 4.7, ny * 1.25 + 2.3, 15) * 1.1;
 
-      const density = (f1 + f2 + f3 + f4) / 1.87;
-      const cloud = Math.max(0, (density * bandMask - 0.47) * 2.15);
-      const alpha = Math.min(220, Math.round(Math.pow(cloud, 1.35) * 210));
+      const f1 = valueNoise2D(nx + warpX, ny + warpY * 0.65, 12);
+      const f2 = valueNoise2D(nx * 2 + warpX * 1.35, ny * 2 - warpY * 0.4, 24) * 0.52;
+      const f3 = valueNoise2D(nx * 4 - warpY * 0.8, ny * 4 + warpX * 0.5, 48) * 0.28;
+      const f4 = valueNoise2D(nx * 8 + warpX * 0.5, ny * 8, 96) * 0.15;
+      const f5 = valueNoise2D(nx * 16, ny * 16, 192) * 0.08;
+
+      const density = (f1 + f2 + f3 + f4 + f5) / 2.03;
+      const cloud = Math.max(0, (density * latEnvelope - 0.44) * 2.35);
+      const alpha = Math.min(235, Math.round(Math.pow(cloud, 1.28) * 224));
 
       const idx = (y * w + x) * 4;
-      data[idx] = 236;
-      data[idx + 1] = 244;
+      data[idx] = 244;
+      data[idx + 1] = 249;
       data[idx + 2] = 255;
       data[idx + 3] = alpha;
     }
@@ -409,6 +692,9 @@ export function createCloudTexture(highRes = true): THREE.CanvasTexture {
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = THREE.RepeatWrapping;
+  tex.generateMipmaps = true;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
   tex.needsUpdate = true;
   return tex;
 }

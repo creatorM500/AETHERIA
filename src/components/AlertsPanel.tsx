@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Activity,
   Bell,
@@ -49,9 +49,17 @@ export function AlertsPanel({
   onClearAlerts,
 }: AlertsPanelProps) {
   const [geoStatus, setGeoStatus] = useState<string | null>(null);
+  const [manualError, setManualError] = useState<string | null>(null);
   const [manualLat, setManualLat] = useState<string>(String(rules.referencePoint.lat));
   const [manualLng, setManualLng] = useState<string>(String(rules.referencePoint.lng));
   const [manualLabel, setManualLabel] = useState<string>(rules.referencePoint.label);
+
+  useEffect(() => {
+    setManualLat(String(rules.referencePoint.lat));
+    setManualLng(String(rules.referencePoint.lng));
+    setManualLabel(rules.referencePoint.label);
+    setManualError(null);
+  }, [rules.referencePoint.lat, rules.referencePoint.lng, rules.referencePoint.label]);
 
   const effectiveRef = resolveAlertReferencePoint(rules, activeSector);
   const notificationSupported = typeof window !== 'undefined' && 'Notification' in window;
@@ -111,15 +119,28 @@ export function AlertsPanel({
   const handleApplyManualCoords = () => {
     const parsedLat = Number(manualLat);
     const parsedLng = Number(manualLng);
-    if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLng)) return;
-    const clampedLat = Math.max(-85, Math.min(85, Number(parsedLat.toFixed(4))));
-    const clampedLng = Math.max(-180, Math.min(180, Number(parsedLng.toFixed(4))));
-    const cleanLabel = manualLabel.trim() || `${clampedLat.toFixed(2)}, ${clampedLng.toFixed(2)}`;
+    if (
+      manualLat.trim() === '' ||
+      manualLng.trim() === '' ||
+      !Number.isFinite(parsedLat) ||
+      !Number.isFinite(parsedLng) ||
+      parsedLat < -85 ||
+      parsedLat > 85 ||
+      parsedLng < -180 ||
+      parsedLng > 180
+    ) {
+      setManualError('Coordenadas inválidas (Lat -85..85, Lng -180..180).');
+      return;
+    }
+    setManualError(null);
+    const cleanLat = Number(parsedLat.toFixed(4));
+    const cleanLng = Number(parsedLng.toFixed(4));
+    const cleanLabel = manualLabel.trim() || `${cleanLat.toFixed(2)}, ${cleanLng.toFixed(2)}`;
     onUpdateRules((prev) => ({
       ...prev,
       referencePoint: {
-        lat: clampedLat,
-        lng: clampedLng,
+        lat: cleanLat,
+        lng: cleanLng,
         label: cleanLabel,
         mode: 'custom',
       },
@@ -453,40 +474,56 @@ export function AlertsPanel({
           {geoStatus && <div className="text-[11px] text-amber-300">{geoStatus}</div>}
 
           {rules.referencePoint.mode === 'custom' && (
-            <div className="grid grid-cols-12 gap-1.5 pt-1">
-              <input
-                type="text"
-                value={manualLabel}
-                onChange={(e) => setManualLabel(e.target.value)}
-                placeholder="Nombre"
-                aria-label="Etiqueta de coordenada de referencia"
-                className="col-span-4 px-2 py-1 text-[11px] bg-[#06090f] border border-white/15 rounded text-white focus:outline-none focus:border-cyan-400"
-              />
-              <input
-                type="number"
-                step="0.01"
-                value={manualLat}
-                onChange={(e) => setManualLat(e.target.value)}
-                placeholder="Lat"
-                aria-label="Latitud de referencia"
-                className="col-span-3 px-2 py-1 text-[11px] font-mono-tabular bg-[#06090f] border border-white/15 rounded text-white focus:outline-none focus:border-cyan-400"
-              />
-              <input
-                type="number"
-                step="0.01"
-                value={manualLng}
-                onChange={(e) => setManualLng(e.target.value)}
-                placeholder="Lng"
-                aria-label="Longitud de referencia"
-                className="col-span-3 px-2 py-1 text-[11px] font-mono-tabular bg-[#06090f] border border-white/15 rounded text-white focus:outline-none focus:border-cyan-400"
-              />
-              <button
-                type="button"
-                onClick={handleApplyManualCoords}
-                className="col-span-2 py-1 text-[11px] font-semibold bg-white/10 hover:bg-cyan-500 hover:text-slate-950 text-white rounded transition-colors"
-              >
-                Fijar
-              </button>
+            <div className="space-y-1.5 pt-1">
+              <div className="grid grid-cols-12 gap-1.5">
+                <input
+                  type="text"
+                  value={manualLabel}
+                  onChange={(e) => {
+                    setManualLabel(e.target.value);
+                    setManualError(null);
+                  }}
+                  placeholder="Nombre"
+                  aria-label="Etiqueta de coordenada de referencia"
+                  className="col-span-4 px-2 py-1 text-[11px] bg-[#06090f] border border-white/15 rounded text-white focus:outline-none focus:border-cyan-400"
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  value={manualLat}
+                  onChange={(e) => {
+                    setManualLat(e.target.value);
+                    setManualError(null);
+                  }}
+                  placeholder="Lat"
+                  aria-label="Latitud de referencia"
+                  className="col-span-3 px-2 py-1 text-[11px] font-mono-tabular bg-[#06090f] border border-white/15 rounded text-white focus:outline-none focus:border-cyan-400"
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  value={manualLng}
+                  onChange={(e) => {
+                    setManualLng(e.target.value);
+                    setManualError(null);
+                  }}
+                  placeholder="Lng"
+                  aria-label="Longitud de referencia"
+                  className="col-span-3 px-2 py-1 text-[11px] font-mono-tabular bg-[#06090f] border border-white/15 rounded text-white focus:outline-none focus:border-cyan-400"
+                />
+                <button
+                  type="button"
+                  onClick={handleApplyManualCoords}
+                  className="col-span-2 py-1 text-[11px] font-semibold bg-white/10 hover:bg-cyan-500 hover:text-slate-950 text-white rounded transition-colors"
+                >
+                  Fijar
+                </button>
+              </div>
+              {manualError && (
+                <div role="alert" className="text-[11px] text-rose-400">
+                  {manualError}
+                </div>
+              )}
             </div>
           )}
         </div>

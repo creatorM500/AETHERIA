@@ -1,8 +1,9 @@
 import { PbfReader } from 'pbf';
 import { classifyRings, VectorTile } from '@mapbox/vector-tile';
 import { PNG } from 'pngjs';
-import { clamp, latToTileY, lngToTileX, sampleTerrainElevation } from '../shared/geo.ts';
+import { clamp, latToTileY, lngToTileX, normalizeLngDeg, sampleTerrainElevation } from '../shared/geo.ts';
 import {
+  carveCoastalWaterElevations,
   computeSingleTileWindow,
   computeTerrainTileWindow,
   decodeTerrariumPixel,
@@ -69,6 +70,8 @@ function getLru<T>(cache: Map<string, CachedEntry<T>>, key: string): T | null {
     cache.delete(key);
     return null;
   }
+  cache.delete(key);
+  cache.set(key, hit);
   return hit.value;
 }
 
@@ -113,6 +116,19 @@ export function ringSignedArea(ring: Array<[number, number]>): number {
  * Computes realistic deterministic building height when OSM omits explicit height/levels,
  * scaling naturally with footprint area and deterministic parcel variation.
  */
+export function parseOsmNumericTag(raw: unknown): number {
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? raw : 0;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim().replace(',', '.');
+    if (!trimmed) return 0;
+    const parsed = Number.parseFloat(trimmed);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
 export function inferBuildingHeightM(
   explicitHeight: number,
   levels: number,
@@ -221,9 +237,9 @@ function parseVectorTileBundle(
       const props = feat.properties ?? {};
       if (props.hide_3d) continue;
 
-      const rawHeight = Number(props.render_height ?? props.height ?? 0);
-      const levels = Number(props['building:levels'] ?? props.levels ?? 0);
-      const rawMinH = Number(props.render_min_height ?? props.min_height ?? 0);
+      const rawHeight = parseOsmNumericTag(props.render_height ?? props.height);
+      const levels = parseOsmNumericTag(props['building:levels'] ?? props.levels);
+      const rawMinH = parseOsmNumericTag(props.render_min_height ?? props.min_height);
 
       const polygons = classifyRings(feat.loadGeometry());
       let subIdx = 0;
@@ -328,6 +344,19 @@ function parseVectorTileBundle(
           len += Math.hypot(coords[k][0] - coords[k - 1][0], coords[k][1] - coords[k - 1][1]);
         }
         if (len < 0.008) continue;
+        const rawName =
+          typeof props['name:es'] === 'string' && props['name:es'].trim()
+            ? props['name:es'].trim()
+            : typeof props.name === 'string' && props.name.trim()
+              ? props.name.trim()
+              : typeof props['name:en'] === 'string' && props['name:en'].trim()
+                ? props['name:en'].trim()
+                : typeof props.street === 'string' && props.street.trim()
+                  ? props.street.trim()
+                  : undefined;
+        const rawRef =
+          typeof props.ref === 'string' && props.ref.trim() ? props.ref.trim() : undefined;
+
         roadCandidates.push({
           score: classified.priority * 10 + len,
           road: {
@@ -335,6 +364,8 @@ function parseVectorTileBundle(
             kind: classified.kind,
             coords,
             widthM: classified.widthM,
+            ...(rawName ? { name: rawName } : {}),
+            ...(rawRef ? { ref: rawRef } : {}),
           },
         });
       }
@@ -343,11 +374,40 @@ function parseVectorTileBundle(
   roadCandidates.sort((a, b) => b.score - a.score);
   const roads = roadCandidates.slice(0, 260).map((c) => c.road);
 
-  // 3. Water Features (polygons + rivers/canals/streams)
+  // 3. Water Features (VersaTiles ocean coastlines + water polygons + rivers/canals/streams)
   const waterFeatures: TerrainWaterFeature[] = [];
+  if (schema === 'versatiles') {
+    const oceanLayer = tile.layers['ocean'];
+    if (oceanLayer && oceanLayer.length > 0) {
+      for (let i = 0; i < oceanLayer.length && waterFeatures.length < 96; i++) {
+        const feat = oceanLayer.feature(i);
+        if (feat.type !== 3) continue;
+        const ext = feat.extent || 4096;
+        const polygons = classifyRings(feat.loadGeometry());
+        for (let pIdx = 0; pIdx < polygons.length && waterFeatures.length < 96; pIdx++) {
+          const rings = polygons[pIdx];
+          if (rings.length === 0) continue;
+          const outer = simplifyNormalizedLine(rings[0], ext, 0.0012);
+          if (outer.length < 3 || Math.abs(ringSignedArea(outer)) < 2e-6) continue;
+          const mappedRings = [outer];
+          for (let h = 1; h < rings.length; h++) {
+            const hole = simplifyNormalizedLine(rings[h], ext, 0.0014);
+            if (hole.length >= 3) mappedRings.push(hole);
+          }
+          waterFeatures.push({
+            id: `${tileKey}-oc-${i}-${pIdx}`,
+            kind: 'ocean',
+            isPolygon: true,
+            rings: mappedRings,
+          });
+        }
+      }
+    }
+  }
+
   const wPolyLayer = tile.layers[schema === 'versatiles' ? 'water_polygons' : 'water'];
   if (wPolyLayer && wPolyLayer.length > 0) {
-    for (let i = 0; i < wPolyLayer.length && waterFeatures.length < 70; i++) {
+    for (let i = 0; i < wPolyLayer.length && waterFeatures.length < 96; i++) {
       const feat = wPolyLayer.feature(i);
       if (feat.type !== 3) continue;
       const props = feat.properties ?? {};
@@ -357,14 +417,14 @@ function parseVectorTileBundle(
 
       const ext = feat.extent || 4096;
       const polygons = classifyRings(feat.loadGeometry());
-      for (let pIdx = 0; pIdx < polygons.length && waterFeatures.length < 70; pIdx++) {
+      for (let pIdx = 0; pIdx < polygons.length && waterFeatures.length < 96; pIdx++) {
         const rings = polygons[pIdx];
         if (rings.length === 0) continue;
-        const outer = simplifyNormalizedLine(rings[0], ext, 0.0035);
+        const outer = simplifyNormalizedLine(rings[0], ext, 0.0012);
         if (outer.length < 3 || Math.abs(ringSignedArea(outer)) < 2e-6) continue;
         const mappedRings = [outer];
         for (let h = 1; h < rings.length; h++) {
-          const hole = simplifyNormalizedLine(rings[h], ext, 0.004);
+          const hole = simplifyNormalizedLine(rings[h], ext, 0.0014);
           if (hole.length >= 3) mappedRings.push(hole);
         }
         waterFeatures.push({
@@ -433,7 +493,7 @@ async function fetchTerrariumTileMeters(z: number, tx: number, ty: number): Prom
   }
 
   const clean = z >= 10 ? despikeDemTile256(out, false) : out;
-  setLru(demTileCache, key, clean, 30 * 60 * 1000, 360);
+  setLru(demTileCache, key, clean, 30 * 60 * 1000, 140);
   return clean;
 }
 
@@ -468,7 +528,7 @@ async function fetchVectorTileWithFallback(
         parsed.roads.length > 0 ||
         parsed.waterFeatures.length > 0
       ) {
-        setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 360);
+        setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 120);
         return { bundle: parsed, source: 'versatiles-osm' };
       }
     }
@@ -490,7 +550,7 @@ async function fetchVectorTileWithFallback(
     if (res.ok) {
       const buf = new Uint8Array(await res.arrayBuffer());
       const parsed = parseVectorTileBundle(buf, 'openfreemap', `ofm/${z}/${tx}/${ty}`);
-      setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 360);
+      setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 120);
       const hasAny =
         parsed.buildings.length > 0 || parsed.roads.length > 0 || parsed.waterFeatures.length > 0;
       return { bundle: parsed, source: hasAny ? 'openfreemap-osm' : 'none' };
@@ -500,7 +560,7 @@ async function fetchVectorTileWithFallback(
   }
 
   const empty: ParsedVectorTileBundle = { buildings: [], roads: [], waterFeatures: [] };
-  setLru(mvtTileBundleCache, key, empty, 10 * 60 * 1000, 360);
+  setLru(mvtTileBundleCache, key, empty, 10 * 60 * 1000, 120);
   return { bundle: empty, source: 'none' };
 }
 
@@ -515,7 +575,7 @@ export async function getRealTerrainForCoordinate(opts: {
   maxBuildings?: number;
 }): Promise<RealTerrainPayload> {
   const lat = clamp(opts.lat, -84, 84);
-  const lng = ((opts.lng + 540) % 360) - 180;
+  const lng = normalizeLngDeg(opts.lng);
   const gridSize = clamp(Math.round(opts.gridSize ?? 81), 33, 145);
   const maxBuildings = clamp(Math.round(opts.maxBuildings ?? 9500), 100, 16000);
 
@@ -679,7 +739,7 @@ export async function getRealTerrainForCoordinate(opts: {
     fetchedAt: new Date().toISOString(),
   };
 
-  setLru(payloadCache, cacheKey, payload, 30 * 60 * 1000, 64);
+  setLru(payloadCache, cacheKey, payload, 30 * 60 * 1000, 16);
   return payload;
 }
 
@@ -733,8 +793,8 @@ export async function getTerrainChunkForTile(opts: {
 
   const demPromise = fetchTerrariumTileMeters(z, tx, ty);
   const vectorPromise =
-    includeBuildings && z === 14
-      ? fetchVectorTileWithFallback(14, tx, ty).catch(() => ({
+    z === 14 || z === 12
+      ? fetchVectorTileWithFallback(z, tx, ty).catch(() => ({
           bundle: { buildings: [], roads: [], waterFeatures: [] } as ParsedVectorTileBundle,
           source: 'none' as const,
         }))
@@ -769,6 +829,18 @@ export async function getTerrainChunkForTile(opts: {
     }
   }
 
+  const vRes = await vectorPromise;
+  if (!isKnownBelowSeaBasin(midLat, midLng) && vRes.bundle.waterFeatures.length > 0) {
+    elevationsM = carveCoastalWaterElevations(
+      elevationsM,
+      gridSize,
+      gridSize,
+      vRes.bundle.waterFeatures,
+      z === 14 ? 32.0 : 12.0,
+      -4.5
+    );
+  }
+
   let minElevationM = Infinity;
   let maxElevationM = -Infinity;
   for (let i = 0; i < elevationsM.length; i++) {
@@ -777,15 +849,17 @@ export async function getTerrainChunkForTile(opts: {
     if (e > maxElevationM) maxElevationM = e;
   }
 
-  const vRes = await vectorPromise;
-  const buildings: TerrainBuildingFootprint[] = vRes.bundle.buildings.slice(0, maxBuildings).map((b) => ({
-    id: b.id,
-    outer: b.outer,
-    holes: b.holes,
-    heightM: b.heightM,
-    minHeightM: b.minHeightM,
-    kind: b.kind,
-  }));
+  const keepBuildingsAndRoads = includeBuildings && z === 14;
+  const buildings: TerrainBuildingFootprint[] = keepBuildingsAndRoads
+    ? vRes.bundle.buildings.slice(0, maxBuildings).map((b) => ({
+        id: b.id,
+        outer: b.outer,
+        holes: b.holes,
+        heightM: b.heightM,
+        minHeightM: b.minHeightM,
+        kind: b.kind,
+      }))
+    : [];
 
   const payload: TerrainChunkPayload = {
     zoom: z,
@@ -800,13 +874,13 @@ export async function getTerrainChunkForTile(opts: {
     minElevationM: Number.isFinite(minElevationM) ? minElevationM : 0,
     maxElevationM: Number.isFinite(maxElevationM) ? maxElevationM : 0,
     buildings,
-    roads: vRes.bundle.roads,
+    roads: keepBuildingsAndRoads ? vRes.bundle.roads : [],
     waterFeatures: vRes.bundle.waterFeatures,
     demSource,
-    buildingsSource: vRes.source,
+    buildingsSource: keepBuildingsAndRoads ? vRes.source : 'none',
   };
 
-  setLru(chunkCache, cacheKey, payload, 25 * 60 * 1000, 260);
+  setLru(chunkCache, cacheKey, payload, 25 * 60 * 1000, 96);
   return payload;
 }
 

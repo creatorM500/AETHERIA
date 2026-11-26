@@ -22,6 +22,7 @@ import {
   classifyRoadKind,
   classifyWaterKind,
   inferBuildingHeightM,
+  parseOsmNumericTag,
   ringSignedArea,
 } from './realTerrain.ts';
 
@@ -362,6 +363,16 @@ test('classifyWaterKind classifies ocean, river, canal, stream, and lake polygon
   assert.equal(classifyWaterKind('stream', false)?.kind, 'stream');
   assert.equal(classifyWaterKind('pond', true)?.kind, 'lake');
   assert.equal(classifyWaterKind('swimming_pool', true), null);
+});
+
+test('parseOsmNumericTag parses OSM heights with units, commas, and invalid strings safely', () => {
+  assert.equal(parseOsmNumericTag('12 m'), 12);
+  assert.equal(parseOsmNumericTag('18m'), 18);
+  assert.equal(parseOsmNumericTag('6,5'), 6.5);
+  assert.equal(parseOsmNumericTag(42), 42);
+  assert.equal(parseOsmNumericTag(null), 0);
+  assert.equal(parseOsmNumericTag('unknown'), 0);
+  assert.equal(parseOsmNumericTag(Number.NaN), 0);
 });
 
 

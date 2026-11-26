@@ -17,6 +17,34 @@ let lastArchiveHydrateMs = 0;
 let hydratingPromise: Promise<void> | null = null;
 const ARCHIVE_HYDRATE_TTL_MS = 10 * 60 * 1000;
 
+const ALLOWED_SUBTYPES = new Set<DisasterSubtype>([
+  'earthquake',
+  'storm',
+  'wildfire',
+  'flood',
+  'volcano',
+  'iceberg',
+]);
+
+export function sanitizeHistorySubtype(raw?: unknown): DisasterSubtype | 'all' {
+  const s = String(raw ?? 'all').trim().toLowerCase();
+  if (!s || s === 'all') return 'all';
+  return ALLOWED_SUBTYPES.has(s as DisasterSubtype) ? (s as DisasterSubtype) : 'all';
+}
+
+export function sanitizeHistoryStatus(raw?: unknown): 'all' | 'active' | 'archived' {
+  const s = String(raw ?? 'all').trim().toLowerCase();
+  if (s === 'active' || s === 'archived') return s;
+  return 'all';
+}
+
+export function sanitizeHistoryLimit(raw?: unknown, fallback = 100): number {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const parsed = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(250, Math.round(parsed)));
+}
+
 export function normalizeDisasterSubtype(raw?: string): DisasterSubtype {
   const s = String(raw ?? '').toLowerCase();
   if (s.includes('eq') || s.includes('earth') || s.includes('quake') || s.includes('sismo')) {
@@ -568,13 +596,16 @@ export async function queryDisasterHistory(
   const conditions: string[] = [];
   const params: Array<string | number> = [];
 
-  if (options.subtype && options.subtype !== 'all') {
+  const safeSubtype = sanitizeHistorySubtype(options.subtype);
+  const safeStatus = sanitizeHistoryStatus(options.status);
+
+  if (safeSubtype !== 'all') {
     conditions.push('subtype = ?');
-    params.push(options.subtype);
+    params.push(safeSubtype);
   }
-  if (options.status && options.status !== 'all') {
+  if (safeStatus !== 'all') {
     conditions.push('status = ?');
-    params.push(options.status);
+    params.push(safeStatus);
   }
   if (options.search && options.search.trim()) {
     const q = `%${options.search.trim().toLowerCase()}%`;
@@ -585,7 +616,7 @@ export async function queryDisasterHistory(
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const limit = Math.max(1, Math.min(250, options.limit ?? 100));
+  const limit = sanitizeHistoryLimit(options.limit, 100);
   params.push(limit);
 
   const rows = db

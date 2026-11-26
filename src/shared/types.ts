@@ -31,6 +31,9 @@ export interface GlobalEvent {
   altitudeKm?: number;
   headingDeg?: number;
   speedKts?: number;
+  maxWindKmh?: number;
+  centralPressureHpa?: number;
+  cycloneCategory?: 0 | 1 | 2 | 3 | 4 | 5;
   severity: SeverityLevel;
   magnitude?: number;
   depthKm?: number;
@@ -44,6 +47,21 @@ export interface GlobalEvent {
   destinationLng?: number;
   destinationLabel?: string;
   rawDetails?: Record<string, unknown>;
+}
+
+export interface CycloneVortexSpec {
+  id: string;
+  title: string;
+  lat: number;
+  lng: number;
+  radiusKm: number;
+  coreRadiusKm: number;
+  outerInfluenceKm: number;
+  maxWindMs: number;
+  centralPressureHpa: number;
+  cycloneCategory: 0 | 1 | 2 | 3 | 4 | 5;
+  vorticityScale: number;
+  spinSign: 1 | -1;
 }
 
 export interface DisasterHistoryRecord {
@@ -195,6 +213,27 @@ export interface TerrainRoadPolyline {
   kind: TerrainRoadKind;
   coords: Array<[number, number]>;
   widthM: number;
+  name?: string;
+  ref?: string;
+}
+
+export interface TrafficCameraFeedPoint {
+  id: string;
+  cameraCode: string;
+  roadName: string;
+  roadKind: TerrainRoadKind;
+  roadRef?: string;
+  lat: number;
+  lng: number;
+  elevationM: number;
+  bearingDeg: number;
+  lanes: number;
+  speedLimitKmh: number;
+  estimatedFlowVph: number;
+  congestionPct: number;
+  avgSpeedKmh: number;
+  solarPhase: 'day' | 'twilight' | 'night';
+  nearbyAlertTitle?: string;
 }
 
 export type TerrainWaterKind = 'ocean' | 'river' | 'canal' | 'lake' | 'stream';
@@ -388,4 +427,133 @@ export interface AlertEvaluationPreview {
   strongestSeismicMag: number | null;
   nearestMeteoKm: number | null;
 }
+
+export interface WeatherRadarPeakPoint {
+  lat: number;
+  lng: number;
+  precipMmH: number;
+  pressureHpa: number;
+}
+
+export interface WeatherRadarMetrics {
+  gridRows: number;
+  gridCols: number;
+  sampleCount: number;
+  minPressureHpa: number;
+  maxPressureHpa: number;
+  avgPressureHpa: number;
+  maxPrecipMmH: number;
+  peakPrecipPoint: WeatherRadarPeakPoint | null;
+}
+
+export interface GlobalWeatherRadarResponse {
+  minLat: number;
+  maxLat: number;
+  latStepDeg: number;
+  minLng: number;
+  lngStepDeg: number;
+  rows: number;
+  cols: number;
+  precipGrid: number[];
+  pressureGrid: number[];
+  cloudGrid: number[];
+  metrics: WeatherRadarMetrics;
+  source: string;
+  updatedAt: string;
+}
+
+export interface IsobarContourSegment {
+  lat1: number;
+  lng1: number;
+  lat2: number;
+  lng2: number;
+  levelHpa: number;
+}
+
+export interface CycloneForecastWaypoint {
+  hoursAhead: number;
+  lat: number;
+  lng: number;
+  coneRadiusKm: number;
+  projectedWindKmh: number;
+  projectedPressureHpa: number;
+}
+
+export interface CycloneForecastCone {
+  cycloneId: string;
+  title: string;
+  cycloneCategory: 0 | 1 | 2 | 3 | 4 | 5;
+  waypoints: CycloneForecastWaypoint[];
+  leftEdge: LatLngPoint[];
+  rightEdge: LatLngPoint[];
+  conePolygon: LatLngPoint[];
+}
+
+export type ZoneBriefingThreatLevel = 'Estable' | 'Vigilancia' | 'Elevado' | 'Crítico';
+
+export interface ZoneBriefingEventItem {
+  id: string;
+  category: EventCategory;
+  subtype: string;
+  title: string;
+  region: string;
+  severity: SeverityLevel;
+  lat: number;
+  lng: number;
+  distanceKm: number;
+  magnitude?: number;
+  summary: string;
+}
+
+export interface ZoneBriefingCycloneThreat {
+  id: string;
+  title: string;
+  cycloneCategory: 0 | 1 | 2 | 3 | 4 | 5;
+  centralPressureHpa: number;
+  maxWindKmh: number;
+  distanceKm: number;
+  minForecastDistanceKm: number;
+  coneInterceptsZone: boolean;
+  lat: number;
+  lng: number;
+}
+
+export interface ZoneBriefingReport {
+  zoneLabel: string;
+  lat: number;
+  lng: number;
+  radiusKm: number;
+  generatedAtIso: string;
+  threatLevel: ZoneBriefingThreatLevel;
+  threatScore: number;
+  summaryLine: string;
+  factors: string[];
+  atmosphere: {
+    windKmh: number;
+    pressureHpa: number;
+    precipMmH: number;
+    cloudPct: number;
+    solarPhaseLabel: string;
+  };
+  seismic24h: {
+    countInZone: number;
+    maxMagnitude: number | null;
+    nearestKm: number | null;
+    strongestPlace: string | null;
+  };
+  counts: {
+    disasters: number;
+    conflicts: number;
+    totalEventsInZone: number;
+  };
+  cyclones: ZoneBriefingCycloneThreat[];
+  nearbyEvents: ZoneBriefingEventItem[];
+  terrain: {
+    minElevationM: number;
+    maxElevationM: number;
+    buildingsCount: number;
+    available: boolean;
+  };
+}
+
 

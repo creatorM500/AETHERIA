@@ -4,8 +4,10 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  CloudRain,
   Copy,
   Cpu,
+  FileText,
   Flame,
   Globe2,
   History,
@@ -23,6 +25,7 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import { AlertToastStack } from './components/AlertToastStack.tsx';
+import { BriefingDrawer } from './components/BriefingDrawer.tsx';
 import { GlobeWebGLCanvas, type GlobePickMode } from './components/GlobeWebGLCanvas.tsx';
 import { GoogleMapsNavigatorView } from './components/GoogleMapsNavigatorView.tsx';
 import { McpConsolePanel } from './components/McpConsolePanel.tsx';
@@ -30,6 +33,7 @@ import { NavigationPanel } from './components/NavigationPanel.tsx';
 import { QuickSearchBar } from './components/QuickSearchBar.tsx';
 import { SeismicEventCard } from './components/SeismicEventCard.tsx';
 import { TelemetryDrawer, type TelemetryDrawerTab } from './components/TelemetryDrawer.tsx';
+import { TrafficCameraPanel } from './components/TrafficCameraPanel.tsx';
 import {
   ALERT_INBOX_STORAGE_KEY,
   ALERT_RULES_STORAGE_KEY,
@@ -39,12 +43,24 @@ import {
   sanitizeAlertRules,
 } from './shared/alertRules.ts';
 import { SECTOR_PRESETS } from './shared/geo.ts';
+import {
+  classifySolarPhase,
+  computeSolarElevationDeg,
+  computeSubSolarPoint,
+} from './shared/solarPosition.ts';
+import { sampleWeatherRadarAtLatLng } from './shared/weatherRadar.ts';
+import {
+  extractCycloneVorticesFromEvents,
+  getEffectiveWindLegendMetrics,
+} from './shared/windField.ts';
+import { computeZoneBriefingReport } from './shared/zoneBriefing.ts';
 import type {
   AlertRuleConfig,
   ClientAlertNotification,
   DisasterHistoryRecord,
   EventCategory,
   GlobalEvent,
+  GlobalWeatherRadarResponse,
   GlobalWindFieldResponse,
   GlobeTextureMode,
   LiveTerrainCoords,
@@ -55,12 +71,13 @@ import type {
   SeismicHeatScaleMetrics,
   SeismicQuake24h,
   TerrainHudStats,
+  TrafficCameraFeedPoint,
   ViewportMode,
   WorldFeedResponse,
   WorldFeedSummary,
 } from './shared/types.ts';
 
-type ActiveDrawer = 'none' | 'telemetry' | 'navigation' | 'mcp';
+type ActiveDrawer = 'none' | 'telemetry' | 'navigation' | 'mcp' | 'briefing';
 
 function loadStoredAlertRules(): AlertRuleConfig {
   if (typeof window === 'undefined') return DEFAULT_ALERT_RULES;
@@ -123,10 +140,21 @@ export default function App() {
   const [seismicMetrics, setSeismicMetrics] = useState<SeismicHeatScaleMetrics | null>(null);
   const [selectedQuake24h, setSelectedQuake24h] = useState<SeismicQuake24h | null>(null);
   const [liveTerrainCoords, setLiveTerrainCoords] = useState<LiveTerrainCoords | null>(null);
-  const [copiedCoordAtMs, setCopiedCoordAtMs] = useState<number>(0);
+  const [coordCopied, setCoordCopied] = useState<boolean>(false);
+  const copyTimerRef = useRef<number | null>(null);
+  const fetchSeqRef = useRef<number>(0);
+  const fetchAbortRef = useRef<AbortController | null>(null);
 
   const [windLayerEnabled, setWindLayerEnabled] = useState<boolean>(true);
   const [windField, setWindField] = useState<GlobalWindFieldResponse | null>(null);
+  const [weatherRadarEnabled, setWeatherRadarEnabled] = useState<boolean>(true);
+  const [weatherRadarField, setWeatherRadarField] = useState<GlobalWeatherRadarResponse | null>(
+    null
+  );
+  const [briefingRadiusKm, setBriefingRadiusKm] = useState<150 | 500 | 1500>(500);
+  const [briefingFocusMode, setBriefingFocusMode] = useState<'sector' | 'globe'>('sector');
+  const [trafficCamera, setTrafficCamera] = useState<TrafficCameraFeedPoint | null>(null);
+  const [trafficCameraFocusNonce, setTrafficCameraFocusNonce] = useState<number>(0);
 
   const [alertRules, setAlertRules] = useState<AlertRuleConfig>(loadStoredAlertRules);
   const [alertNotifications, setAlertNotifications] =
@@ -213,15 +241,24 @@ export default function App() {
   }, [mapsApiKey]);
 
   const fetchWorldEvents = useCallback(async () => {
+    fetchAbortRef.current?.abort();
+    const controller = new AbortController();
+    fetchAbortRef.current = controller;
+    const seq = ++fetchSeqRef.current;
+
     try {
       setFeedError(null);
-      const [eventsRes, seismicRes, windRes] = await Promise.all([
-        fetch('/api/world/events?category=all'),
-        fetch('/api/earthquakes/24h').catch(() => null),
-        fetch('/api/wind/global').catch(() => null),
+      const [eventsRes, seismicRes, windRes, radarRes] = await Promise.all([
+        fetch('/api/world/events?category=all', { signal: controller.signal }),
+        fetch('/api/earthquakes/24h', { signal: controller.signal }).catch(() => null),
+        fetch('/api/wind/global', { signal: controller.signal }).catch(() => null),
+        fetch('/api/weather/radar', { signal: controller.signal }).catch(() => null),
       ]);
+      if (seq !== fetchSeqRef.current || controller.signal.aborted) return;
       if (!eventsRes.ok) throw new Error('Error al sincronizar telemetría global');
       const data = (await eventsRes.json()) as WorldFeedResponse;
+      if (seq !== fetchSeqRef.current || controller.signal.aborted) return;
+
       const filteredEvents = data.events.filter(
         (ev) => ev.category !== 'flight' && ev.category !== 'ship'
       );
@@ -235,20 +272,40 @@ export default function App() {
 
       if (seismicRes && seismicRes.ok) {
         const seismicPayload = (await seismicRes.json()) as SeismicHeatmap24hResponse;
+        if (seq !== fetchSeqRef.current || controller.signal.aborted) return;
         setSeismicQuakes24h(seismicPayload.quakes ?? []);
         setSeismicMetrics(seismicPayload.metrics ?? null);
       }
 
       if (windRes && windRes.ok) {
         const windPayload = (await windRes.json()) as GlobalWindFieldResponse;
+        if (seq !== fetchSeqRef.current || controller.signal.aborted) return;
         if (Array.isArray(windPayload.uGrid) && Array.isArray(windPayload.vGrid)) {
           setWindField(windPayload);
         }
       }
+
+      if (radarRes && radarRes.ok) {
+        const radarPayload = (await radarRes.json()) as GlobalWeatherRadarResponse;
+        if (seq !== fetchSeqRef.current || controller.signal.aborted) return;
+        if (
+          Array.isArray(radarPayload.precipGrid) &&
+          Array.isArray(radarPayload.pressureGrid)
+        ) {
+          setWeatherRadarField(radarPayload);
+        }
+      }
     } catch (err) {
-      setFeedError(err instanceof Error ? err.message : 'Error de red');
+      if (controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+        return;
+      }
+      if (seq === fetchSeqRef.current) {
+        setFeedError(err instanceof Error ? err.message : 'Error de red');
+      }
     } finally {
-      setIsLoadingFeed(false);
+      if (seq === fetchSeqRef.current) {
+        setIsLoadingFeed(false);
+      }
     }
   }, []);
 
@@ -270,6 +327,11 @@ export default function App() {
     return () => {
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onVis);
+      fetchAbortRef.current?.abort();
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
     };
   }, [fetchWorldEvents]);
 
@@ -504,8 +566,24 @@ export default function App() {
     setSelectedQuake24h(quake);
     if (quake) {
       setSelectedEvent(null);
+      setTrafficCamera(null);
     }
   }, []);
+
+  const handleSelectTrafficCamera = useCallback((cam: TrafficCameraFeedPoint | null) => {
+    setTrafficCamera(cam);
+    setTrafficCameraFocusNonce(0);
+    if (cam) {
+      setSelectedQuake24h(null);
+      setSelectedEvent(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (viewportMode !== 'sector3d') {
+      setTrafficCamera(null);
+    }
+  }, [viewportMode, activeSector.id]);
 
   const handleJumpQuakeToTerrain3D = useCallback(
     (quake: SeismicQuake24h) => {
@@ -537,7 +615,14 @@ export default function App() {
     if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
       void navigator.clipboard.writeText(text).catch(() => undefined);
     }
-    setCopiedCoordAtMs(Date.now());
+    setCoordCopied(true);
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    copyTimerRef.current = window.setTimeout(() => {
+      setCoordCopied(false);
+      copyTimerRef.current = null;
+    }, 2000);
   }, [activeSector.lat, activeSector.lng, liveTerrainCoords]);
 
   const handleFlyTo = useCallback((lat: number, lng: number, zoomDistance = 17.5) => {
@@ -674,6 +759,73 @@ export default function App() {
     return { index: idx + 1, total: activeRoute.steps.length, step: activeRoute.steps[idx] };
   }, [activeRoute, flyAlongProgress]);
 
+  const activeCyclones = useMemo(
+    () => extractCycloneVorticesFromEvents(events),
+    [events]
+  );
+
+  const windLegendStats = useMemo(
+    () => (windField ? getEffectiveWindLegendMetrics(windField, activeCyclones) : null),
+    [windField, activeCyclones]
+  );
+
+  const solarStatus = useMemo(() => {
+    const subSolar = computeSubSolarPoint(Date.now());
+    const lat = globeAltitude?.lat ?? activeSector.lat;
+    const lng = globeAltitude?.lng ?? activeSector.lng;
+    const elev = computeSolarElevationDeg(lat, lng, subSolar.sunDir);
+    const phase = classifySolarPhase(elev);
+    const phaseLabel = phase === 'day' ? 'Día' : phase === 'twilight' ? 'Crepúsculo' : 'Noche';
+    return {
+      utcLabel: subSolar.utcLabel,
+      phase,
+      phaseLabel,
+    };
+  }, [globeAltitude?.lat, globeAltitude?.lng, activeSector.lat, activeSector.lng]);
+
+  const briefingReport = useMemo(() => {
+    const useGlobe = briefingFocusMode === 'globe' && globeAltitude !== null;
+    const targetLat = useGlobe ? globeAltitude!.lat : activeSector.lat;
+    const targetLng = useGlobe ? globeAltitude!.lng : activeSector.lng;
+    const targetLabel = useGlobe
+      ? `Centro del globo (${targetLat.toFixed(2)}°, ${targetLng.toFixed(2)}°)`
+      : `${activeSector.name} · ${activeSector.country}`;
+
+    return computeZoneBriefingReport({
+      zoneLabel: targetLabel,
+      lat: targetLat,
+      lng: targetLng,
+      radiusKm: briefingRadiusKm,
+      events,
+      seismicQuakes24h,
+      windField,
+      radarField: weatherRadarField,
+      cyclones: activeCyclones,
+      terrainStats,
+      solarPhaseLabel: solarStatus.phaseLabel,
+    });
+  }, [
+    briefingFocusMode,
+    globeAltitude,
+    activeSector.lat,
+    activeSector.lng,
+    activeSector.name,
+    activeSector.country,
+    briefingRadiusKm,
+    events,
+    seismicQuakes24h,
+    windField,
+    weatherRadarField,
+    activeCyclones,
+    terrainStats,
+    solarStatus.phaseLabel,
+  ]);
+
+  const trafficCameraPrecipMmH = useMemo(() => {
+    if (!trafficCamera || !weatherRadarField) return 0;
+    return sampleWeatherRadarAtLatLng(weatherRadarField, trafficCamera.lat, trafficCamera.lng).precipMmH;
+  }, [trafficCamera, weatherRadarField]);
+
   const categoryTabs: Array<{
     id: EventCategory | 'all';
     label: string;
@@ -693,6 +845,8 @@ export default function App() {
       data-category-filter={categoryFilter}
       data-event-count={visibleEvents.length}
       data-wind-layer={windLayerEnabled ? 'on' : 'off'}
+      data-weather-radar={weatherRadarEnabled ? 'on' : 'off'}
+      data-traffic-camera={trafficCamera ? trafficCamera.cameraCode : 'none'}
       data-unread-alerts={unreadAlertCount}
     >
       {/* Google Maps Quota Exceeded Banner (Required by Case A) */}
@@ -852,16 +1006,31 @@ export default function App() {
             onLiveTerrainCoordsChange={setLiveTerrainCoords}
             windLayerEnabled={windLayerEnabled}
             windField={windField}
+            windCycloneEvents={events}
+            weatherRadarEnabled={weatherRadarEnabled}
+            weatherRadarField={weatherRadarField}
+            trafficCameraPoint={
+              trafficCamera
+                ? {
+                    lat: trafficCamera.lat,
+                    lng: trafficCamera.lng,
+                    bearingDeg: trafficCamera.bearingDeg,
+                    focusNonce: trafficCameraFocusNonce,
+                  }
+                : null
+            }
+            onSelectTrafficCamera={handleSelectTrafficCamera}
           />
         )}
 
-        {/* Unified Bottom-Left Dynamic Layer Legends (Wind 3D + 24h Seismic Heatmap) */}
+        {/* Unified Bottom-Left Dynamic Layer Legends (Wind 3D + Weather Radar + 24h Seismic Heatmap) */}
         {viewportMode !== 'maps' &&
           activeDrawer === 'none' &&
           ((viewportMode === 'globe' && windLayerEnabled && windField) ||
+            (viewportMode === 'globe' && weatherRadarEnabled && weatherRadarField) ||
             (seismicHeatmapEnabled && seismicMetrics)) && (
             <div className="fixed bottom-16 left-4 sm:left-5 z-10 hidden sm:flex flex-col w-[224px] bg-[#080d16]/90 border border-white/[0.08] rounded-lg divide-y divide-white/[0.07] shadow-xl overflow-hidden">
-              {viewportMode === 'globe' && windLayerEnabled && windField && (
+              {viewportMode === 'globe' && windLayerEnabled && windField && windLegendStats && (
                 <aside
                   aria-label="Escala de velocidad del viento global en tiempo real"
                   data-testid="wind-speed-legend"
@@ -873,7 +1042,9 @@ export default function App() {
                       <span>Viento 3D</span>
                     </span>
                     <span className="font-mono-tabular text-[10px] text-slate-400">
-                      Prom {windField.metrics.avgSpeedKmh} km/h
+                      {windLegendStats.activeCycloneCount > 0
+                        ? `${windLegendStats.activeCycloneCount} ciclón · ${windField.metrics.avgSpeedKmh} km/h`
+                        : `Prom ${windField.metrics.avgSpeedKmh} km/h`}
                     </span>
                   </div>
 
@@ -888,28 +1059,81 @@ export default function App() {
 
                   <div className="flex items-center justify-between text-[10px] font-mono-tabular text-slate-400">
                     <span>0</span>
-                    <span>{Math.round(Math.max(65, windField.metrics.maxSpeedKmh) / 2)}</span>
+                    <span>{Math.round(Math.max(65, windLegendStats.maxSpeedKmh) / 2)}</span>
                     <span className="text-cyan-300 font-medium">
-                      {Math.max(65, windField.metrics.maxSpeedKmh)}+ km/h
+                      {Math.max(65, windLegendStats.maxSpeedKmh)}+ km/h
                     </span>
                   </div>
 
-                  {windField.metrics.peakPoint && (
+                  {windLegendStats.peakPoint && (
                     <button
                       type="button"
                       onClick={() =>
                         handleFlyTo(
-                          windField.metrics.peakPoint!.lat,
-                          windField.metrics.peakPoint!.lng,
+                          windLegendStats.peakPoint!.lat,
+                          windLegendStats.peakPoint!.lng,
                           16.0
                         )
                       }
-                      title="Enfocar corriente de viento más intensa en tiempo real"
+                      title="Enfocar corriente o ciclón más intenso en tiempo real"
                       className="text-left text-[10px] text-slate-400 hover:text-cyan-300 truncate transition-colors"
                     >
-                      Máx {windField.metrics.peakPoint.speedKmh} km/h ·{' '}
-                      {windField.metrics.peakPoint.lat.toFixed(1)}°,{' '}
-                      {windField.metrics.peakPoint.lng.toFixed(1)}°
+                      Máx {windLegendStats.peakPoint.speedKmh} km/h ·{' '}
+                      {windLegendStats.peakPoint.lat.toFixed(1)}°,{' '}
+                      {windLegendStats.peakPoint.lng.toFixed(1)}°
+                    </button>
+                  )}
+                </aside>
+              )}
+
+              {viewportMode === 'globe' && weatherRadarEnabled && weatherRadarField && (
+                <aside
+                  aria-label="Radar de precipitación, isobaras y cono ciclónico"
+                  data-testid="weather-radar-legend"
+                  className="flex flex-col gap-1 px-2.5 py-2"
+                >
+                  <div className="flex items-center justify-between gap-2 text-[11px]">
+                    <span className="flex items-center gap-1.5 font-medium text-white">
+                      <CloudRain className="w-3 h-3 text-sky-400 shrink-0" />
+                      <span>Radar · hPa</span>
+                    </span>
+                    <span className="font-mono-tabular text-[10px] text-slate-400">
+                      {weatherRadarField.metrics.minPressureHpa}–
+                      {weatherRadarField.metrics.maxPressureHpa} hPa
+                    </span>
+                  </div>
+
+                  <div
+                    aria-hidden="true"
+                    className="h-1.5 w-full rounded-full"
+                    style={{
+                      background:
+                        'linear-gradient(90deg, #38bdf8 0%, #10b981 24%, #84cc16 40%, #facc15 56%, #f97316 72%, #ef4444 86%, #e879f9 100%)',
+                    }}
+                  />
+
+                  <div className="flex items-center justify-between text-[10px] font-mono-tabular text-slate-400">
+                    <span>0.2</span>
+                    <span>10</span>
+                    <span className="text-sky-300 font-medium">
+                      {Math.max(35, Math.round(weatherRadarField.metrics.maxPrecipMmH))}+ mm/h
+                    </span>
+                  </div>
+
+                  {(weatherRadarField.metrics.peakPrecipPoint || activeCyclones.length > 0) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const target =
+                          activeCyclones[0] ?? weatherRadarField.metrics.peakPrecipPoint;
+                        if (target) handleFlyTo(target.lat, target.lng, 16.0);
+                      }}
+                      title="Enfocar núcleo de lluvia o trayectoria ciclónica 72h"
+                      className="text-left text-[10px] text-slate-400 hover:text-cyan-300 truncate transition-colors"
+                    >
+                      {activeCyclones.length > 0
+                        ? `Cono 72h activo (${activeCyclones.length}) · Enfocar`
+                        : `Lluvia máx ${weatherRadarField.metrics.peakPrecipPoint!.precipMmH} mm/h`}
                     </button>
                   )}
                 </aside>
@@ -1003,13 +1227,7 @@ export default function App() {
               }
             />
 
-            <div
-              className={`pointer-events-none hidden md:flex items-center gap-1.5 text-[11px] text-slate-300/90 ${
-                viewportMode === 'sector3d'
-                  ? 'bg-[#06090f]/75 border border-white/[0.06] rounded-md px-2 py-0.5 shadow-md'
-                  : 'drop-shadow-[0_1px_4px_rgba(0,0,0,0.95)]'
-              }`}
-            >
+            <div className="pointer-events-none hidden md:flex items-center gap-1.5 text-[11px] text-slate-300/95 bg-[#06090f]/88 border border-white/[0.07] rounded-md px-2 py-0.5 shadow-md">
               <span className="font-medium text-white">
                 {viewportMode === 'sector3d'
                   ? `Terreno 3D · ${activeSector.name}`
@@ -1043,6 +1261,23 @@ export default function App() {
                       ? `${globeAltitude.altitudeMeters} m`
                       : `${(globeAltitude.altitudeMeters / 1000).toFixed(1)} km`}
                     {globeAltitude.tileZoom > 0 ? ` · z${globeAltitude.tileZoom}` : ''}
+                  </span>
+                </>
+              )}
+              {viewportMode === 'globe' && textureMode === 'satellite' && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span
+                    data-testid="solar-phase-readout"
+                    className={`font-mono-tabular ${
+                      solarStatus.phase === 'day'
+                        ? 'text-amber-300'
+                        : solarStatus.phase === 'twilight'
+                          ? 'text-orange-300'
+                          : 'text-indigo-300'
+                    }`}
+                  >
+                    {solarStatus.utcLabel} · {solarStatus.phaseLabel}
                   </span>
                 </>
               )}
@@ -1082,7 +1317,7 @@ export default function App() {
                 <span className="text-slate-400">
                   {liveTerrainCoords?.source === 'cursor' ? 'Cursor' : 'Objetivo'}
                 </span>
-                {copiedCoordAtMs > 0 && Date.now() - copiedCoordAtMs < 2000 ? (
+                {coordCopied ? (
                   <Check className="w-3 h-3 text-emerald-400 shrink-0" />
                 ) : (
                   <Copy className="w-3 h-3 text-slate-400 shrink-0" />
@@ -1270,6 +1505,17 @@ export default function App() {
           />
         )}
 
+        {/* Street-level 360° Inspection Panel (Click road network in Terreno 3D) */}
+        {trafficCamera && viewportMode === 'sector3d' && activeDrawer === 'none' && (
+          <TrafficCameraPanel
+            camera={trafficCamera}
+            mapsApiKey={mapsApiKey}
+            precipMmH={trafficCameraPrecipMmH}
+            onFocusPoint={() => setTrafficCameraFocusNonce(Date.now())}
+            onClose={() => setTrafficCamera(null)}
+          />
+        )}
+
         {/* Fallback Alert Toast Stack when a side drawer (other than Alerts) is open */}
         {viewportMode !== 'maps' &&
           activeDrawer !== 'none' &&
@@ -1344,6 +1590,30 @@ export default function App() {
       )}
 
       {activeDrawer === 'mcp' && <McpConsolePanel onClose={() => setActiveDrawer('none')} />}
+
+      {activeDrawer === 'briefing' && (
+        <BriefingDrawer
+          report={briefingReport}
+          radiusKm={briefingRadiusKm}
+          onRadiusChange={setBriefingRadiusKm}
+          focusTargetMode={briefingFocusMode}
+          onFocusTargetModeChange={setBriefingFocusMode}
+          canUseGlobeCenter={globeAltitude !== null}
+          onFlyTo={(lat, lng, zoom) => {
+            setActiveDrawer('none');
+            handleFlyTo(lat, lng, zoom);
+          }}
+          onOpenTerrain3D={(lat, lng, label, sublabel) => {
+            setActiveDrawer('none');
+            void openTerrainAtCoordinate(lat, lng, label, sublabel);
+          }}
+          onSelectEventId={(id) => {
+            const matched = events.find((e) => e.id === id);
+            if (matched) handleSelectEvent(matched);
+          }}
+          onClose={() => setActiveDrawer('none')}
+        />
+      )}
 
       {/* Unified Single-Row Collapsible Bottom Control Dock (Zero Viewport Occlusion) */}
       <div
@@ -1562,6 +1832,30 @@ export default function App() {
 
             <button
               type="button"
+              data-testid="weather-radar-toggle"
+              onClick={() => {
+                if (viewportMode !== 'globe') {
+                  setWeatherRadarEnabled(true);
+                  setViewportMode('globe');
+                } else {
+                  setWeatherRadarEnabled((v) => !v);
+                }
+              }}
+              aria-pressed={weatherRadarEnabled && viewportMode === 'globe'}
+              aria-label="Alternar radar de precipitación, presión atmosférica y conos ciclónicos"
+              title="Radar meteorológico (lluvia, isobaras y cono 72h)"
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                weatherRadarEnabled && viewportMode === 'globe'
+                  ? 'bg-sky-500/15 text-sky-300'
+                  : 'text-slate-300 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <CloudRain className="w-3 h-3 shrink-0" />
+              <span>Radar</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setSeismicHeatmapEnabled((v) => !v)}
               aria-pressed={seismicHeatmapEnabled}
               aria-label="Alternar capa de calor sísmico de las últimas 24 horas"
@@ -1627,6 +1921,24 @@ export default function App() {
                   {unreadAlertCount}
                 </span>
               )}
+            </button>
+
+            <button
+              type="button"
+              data-testid="dock-briefing-button"
+              onClick={() =>
+                setActiveDrawer((prev) => (prev === 'briefing' ? 'none' : 'briefing'))
+              }
+              aria-label="Abrir briefing operativo por zona"
+              title="Resumen operativo de riesgo, clima y sismicidad por zona"
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                activeDrawer === 'briefing'
+                  ? 'bg-cyan-500 text-slate-950'
+                  : 'text-slate-300 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <FileText className="w-3 h-3 shrink-0" />
+              <span>Briefing</span>
             </button>
 
             <button

@@ -20,9 +20,13 @@ import type {
 } from './src/shared/types.ts';
 import { getEarthquakesLast24h, getWorldFeed } from './src/server/worldFeed.ts';
 import { getGlobalWindField } from './src/server/windFeed.ts';
+import { getGlobalWeatherRadar } from './src/server/weatherRadarFeed.ts';
 import {
   hydrateDisasterHistoryFromArchives,
   queryDisasterHistory,
+  sanitizeHistoryLimit,
+  sanitizeHistoryStatus,
+  sanitizeHistorySubtype,
 } from './src/server/disasterHistory.ts';
 import {
   getPlanetaryDemGrid,
@@ -143,12 +147,22 @@ async function startServer() {
     }
   });
 
+  app.get('/api/weather/radar', async (_req, res) => {
+    try {
+      const radar = await getGlobalWeatherRadar();
+      res.json(radar);
+    } catch (error) {
+      console.error('Error fetching weather radar:', error);
+      res.status(500).json({ error: 'No se pudo obtener el radar meteorológico global.' });
+    }
+  });
+
   app.get('/api/disasters/history', async (req, res) => {
     try {
-      const subtype = String(req.query.subtype ?? 'all') as DisasterSubtype | 'all';
-      const status = String(req.query.status ?? 'all') as 'all' | 'active' | 'archived';
+      const subtype = sanitizeHistorySubtype(req.query.subtype);
+      const status = sanitizeHistoryStatus(req.query.status);
       const search = String(req.query.q ?? '');
-      const limit = Number(req.query.limit ?? 120);
+      const limit = sanitizeHistoryLimit(req.query.limit, 120);
       await getWorldFeed('disaster').catch(() => null);
       const history = await queryDisasterHistory({ subtype, status, search, limit });
       res.json(history);
@@ -160,8 +174,8 @@ async function startServer() {
 
   app.post('/api/disasters/history/sync', async (req, res) => {
     try {
-      const subtype = String(req.body?.subtype ?? 'all') as DisasterSubtype | 'all';
-      const status = String(req.body?.status ?? 'all') as 'all' | 'active' | 'archived';
+      const subtype = sanitizeHistorySubtype(req.body?.subtype);
+      const status = sanitizeHistoryStatus(req.body?.status);
       const search = String(req.body?.q ?? '');
       await hydrateDisasterHistoryFromArchives(true);
       await getWorldFeed('disaster').catch(() => null);
@@ -175,7 +189,7 @@ async function startServer() {
 
   app.get('/api/disasters/history/export', async (req, res) => {
     try {
-      const subtype = String(req.query.subtype ?? 'all') as DisasterSubtype | 'all';
+      const subtype = sanitizeHistorySubtype(req.query.subtype);
       const history = await queryDisasterHistory({ subtype, status: 'all', limit: 250 });
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader(
@@ -248,6 +262,101 @@ async function startServer() {
     }
   });
 
+  app.get('/api/traffic/street-photo/metadata', async (req, res) => {
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 85 || Math.abs(lng) > 180) {
+      res.status(400).json({ available: false });
+      return;
+    }
+
+    const mapsKey = getMapsApiKey();
+    if (!mapsKey) {
+      res.json({ available: false });
+      return;
+    }
+
+    try {
+      const metaUrl = new URL('https://maps.googleapis.com/maps/api/streetview/metadata');
+      metaUrl.searchParams.set('location', `${lat.toFixed(6)},${lng.toFixed(6)}`);
+      metaUrl.searchParams.set('radius', '120');
+      metaUrl.searchParams.set('source', 'outdoor');
+      metaUrl.searchParams.set('key', mapsKey);
+
+      const metaRes = await fetch(metaUrl.toString(), {
+        signal: AbortSignal.timeout(4500),
+      });
+      if (!metaRes.ok) {
+        res.json({ available: false });
+        return;
+      }
+
+      const payload = (await metaRes.json()) as {
+        status?: string;
+        pano_id?: string;
+        date?: string;
+        location?: { lat?: number; lng?: number };
+      };
+      if (payload.status !== 'OK' || !payload.pano_id) {
+        res.json({ available: false });
+        return;
+      }
+
+      res.json({
+        available: true,
+        panoId: payload.pano_id,
+        date: payload.date ?? null,
+        lat: payload.location?.lat ?? lat,
+        lng: payload.location?.lng ?? lng,
+      });
+    } catch {
+      res.json({ available: false });
+    }
+  });
+
+  app.get('/api/traffic/street-photo', async (req, res) => {
+    const pano = String(req.query.pano ?? '').trim();
+    const headingRaw = Number(req.query.heading ?? 0);
+    if (!/^[A-Za-z0-9_.-]{8,160}$/.test(pano)) {
+      res.status(400).json({ error: 'Identificador de panorama inválido.' });
+      return;
+    }
+    const mapsKey = getMapsApiKey();
+    if (!mapsKey) {
+      res.status(404).json({ error: 'Sin clave de mapas configurada.' });
+      return;
+    }
+
+    const heading = Number.isFinite(headingRaw) ? Math.round(((headingRaw % 360) + 360) % 360) : 0;
+
+    try {
+      const imgUrl = new URL('https://maps.googleapis.com/maps/api/streetview');
+      imgUrl.searchParams.set('size', '624x344');
+      imgUrl.searchParams.set('pano', pano);
+      imgUrl.searchParams.set('heading', String(heading));
+      imgUrl.searchParams.set('pitch', '4');
+      imgUrl.searchParams.set('fov', '82');
+      imgUrl.searchParams.set('return_error_code', 'true');
+      imgUrl.searchParams.set('key', mapsKey);
+
+      const imgRes = await fetch(imgUrl.toString(), {
+        signal: AbortSignal.timeout(6000),
+      });
+      const contentType = imgRes.headers.get('content-type') ?? '';
+      if (!imgRes.ok || !contentType.startsWith('image/')) {
+        res.status(404).json({ error: 'Fotografía no disponible para este punto.' });
+        return;
+      }
+
+      const buf = Buffer.from(await imgRes.arrayBuffer());
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.send(buf);
+    } catch {
+      res.status(404).json({ error: 'Error al obtener la fotografía.' });
+    }
+  });
+
   app.post('/api/places/search', async (req, res) => {
     const query = String(req.body?.query ?? '').trim();
     if (!query) {
@@ -272,6 +381,7 @@ async function startServer() {
             languageCode: 'es',
             maxResultCount: 6,
           }),
+          signal: AbortSignal.timeout(6000),
         });
 
         if (gRes.status === 429) {
@@ -474,6 +584,7 @@ async function startServer() {
               'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
             },
             body: JSON.stringify(body),
+            signal: AbortSignal.timeout(6000),
           });
 
           if (gRes.status === 429) {

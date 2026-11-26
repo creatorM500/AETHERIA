@@ -10,16 +10,43 @@ import type { TerrainBuildingFootprint } from '../shared/types.ts';
 
 export { ARCH_BASE_PALETTE, ARCH_ROOF_PALETTE };
 
-export function rawBuffersToThreeGeometry(raw: RawIndexedBuffers | null): THREE.BufferGeometry | null {
+function releaseAttributeArrayAfterUpload(this: THREE.BufferAttribute) {
+  const arr = this.array as THREE.TypedArray | undefined;
+  if (arr && arr.length > 0) {
+    const Ctor = arr.constructor as { new (len: number): THREE.TypedArray };
+    (this as unknown as { array: THREE.TypedArray }).array = new Ctor(0);
+  }
+}
+
+export function rawBuffersToThreeGeometry(
+  raw: RawIndexedBuffers | null,
+  releaseCpuAfterUpload = true
+): THREE.BufferGeometry | null {
   if (!raw || raw.vertexCount === 0 || raw.indexCount === 0) return null;
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(raw.pos, 3));
-  geo.setAttribute('normal', new THREE.BufferAttribute(raw.norm, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(raw.col, 3));
-  if (raw.uv) {
-    geo.setAttribute('uv', new THREE.BufferAttribute(raw.uv, 2));
+  const posAttr = new THREE.BufferAttribute(raw.pos, 3);
+  const normAttr = new THREE.BufferAttribute(raw.norm, 3, !(raw.norm instanceof Float32Array));
+  const colAttr = new THREE.BufferAttribute(raw.col, 3, !(raw.col instanceof Float32Array));
+  const idxAttr = new THREE.BufferAttribute(raw.index, 1);
+
+  if (releaseCpuAfterUpload) {
+    posAttr.onUpload(releaseAttributeArrayAfterUpload);
+    normAttr.onUpload(releaseAttributeArrayAfterUpload);
+    colAttr.onUpload(releaseAttributeArrayAfterUpload);
+    idxAttr.onUpload(releaseAttributeArrayAfterUpload);
   }
-  geo.setIndex(new THREE.BufferAttribute(raw.index, 1));
+
+  geo.setAttribute('position', posAttr);
+  geo.setAttribute('normal', normAttr);
+  geo.setAttribute('color', colAttr);
+  if (raw.uv) {
+    const uvAttr = new THREE.BufferAttribute(raw.uv, 2);
+    if (releaseCpuAfterUpload) {
+      uvAttr.onUpload(releaseAttributeArrayAfterUpload);
+    }
+    geo.setAttribute('uv', uvAttr);
+  }
+  geo.setIndex(idxAttr);
   geo.computeBoundingSphere();
   return geo;
 }
@@ -68,8 +95,8 @@ export function buildGlobeTileBuildingsFast(opts: {
   builtCount: number;
 } {
   const { buildings, projectUVMeters, seedOffset = 0 } = opts;
-  const stdBuilder = new IndexedTypedGeometryBuilder(Math.min(180000, buildings.length * 18 + 512));
-  const towerBuilder = new IndexedTypedGeometryBuilder(4096);
+  const stdBuilder = new IndexedTypedGeometryBuilder(Math.min(64000, buildings.length * 14 + 256), false, true);
+  const towerBuilder = new IndexedTypedGeometryBuilder(1024, false, true);
   const baseCol = new THREE.Color();
   const roofCol = new THREE.Color();
   let builtCount = 0;

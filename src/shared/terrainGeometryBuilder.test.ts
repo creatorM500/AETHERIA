@@ -6,19 +6,14 @@ import {
   buildChunkBuildingsRaw,
   buildChunkRoadsRaw,
   buildChunkWaterRaw,
+  estimateRawBuffersByteLength,
+  type RawIndexedBuffers,
 } from './terrainGeometryBuilder.ts';
+import { carveCoastalWaterElevations } from './terrainMath.ts';
 import type { TerrainChunkPayload } from './types.ts';
 
 function assertValidRawBuffers(
-  buf: {
-    pos: Float32Array;
-    norm: Float32Array;
-    col: Float32Array;
-    uv?: Float32Array;
-    index: Uint16Array | Uint32Array;
-    vertexCount: number;
-    indexCount: number;
-  } | null,
+  buf: RawIndexedBuffers | null,
   label: string
 ) {
   assert.ok(buf, `${label} should be non-null`);
@@ -97,11 +92,25 @@ test('buildChunkBuildingsRaw generates pitched gable/hipped roofs on small homes
     res.towerGeo!.vertexCount > 36,
     `expected multi-tier tower setbacks (>36 verts), got ${res.towerGeo!.vertexCount}`
   );
-  // Verify pitched roofs produce sloped roof normals (ny between 0.1 and 0.99)
+  // Verify compact attribute storage (Int8Array normals + Uint8Array colors) cuts vertex bloat by 50%
+  assert.ok(res.stdGeo!.norm instanceof Int8Array, 'stdGeo.norm must be compact Int8Array');
+  assert.ok(res.stdGeo!.col instanceof Uint8Array, 'stdGeo.col must be compact Uint8Array');
+  assert.ok(res.towerGeo!.norm instanceof Int8Array, 'towerGeo.norm must be compact Int8Array');
+  assert.ok(res.towerGeo!.col instanceof Uint8Array, 'towerGeo.col must be compact Uint8Array');
+
+  const stdBytes = estimateRawBuffersByteLength(res.stdGeo);
+  const legacyFloatBytes = res.stdGeo!.vertexCount * 36 + res.stdGeo!.indexCount * 2;
+  assert.ok(
+    stdBytes <= legacyFloatBytes * 0.6,
+    `expected compact byte size (${stdBytes}) <= 60% of legacy Float32 size (${legacyFloatBytes})`
+  );
+
+  // Verify pitched roofs produce sloped roof normals (ny between 0.1 and 0.99 in normalized Int8 space)
   let hasSlopedNormal = false;
   const n = res.stdGeo!.norm;
   for (let i = 0; i < n.length; i += 3) {
-    if (n[i + 1] > 0.1 && n[i + 1] < 0.98) {
+    const ny = n[i + 1] / 127;
+    if (ny > 0.1 && ny < 0.98) {
       hasSlopedNormal = true;
       break;
     }
@@ -290,4 +299,207 @@ test('buildAllChunkGeometriesRaw combines buildings, roads, and water cleanly fo
   assertValidRawBuffers(out.towerGeo, 'combined.towerGeo');
   assertValidRawBuffers(out.roadsGeo, 'combined.roadsGeo');
   assertValidRawBuffers(out.waterGeo, 'combined.waterGeo');
+});
+
+test('buildChunkWaterRaw deduplicates overlapping MVT ocean/bay polygons and keeps offshore depth uniform', () => {
+  const flatOceanElev = new Array<number>(5 * 5).fill(0);
+  const coastalDemFallback = buildChunkWaterRaw({
+    waterFeatures: [],
+    elevationsM: flatOceanElev,
+    rows: 5,
+    cols: 5,
+    minElevationM: 0,
+    baseElevationM: -5,
+    metersToSceneY: 48 / 2400,
+    chunkWidth: 48,
+    chunkDepth: 48,
+    verticalExaggeration: 1.5,
+    isCoastalTile: true,
+  });
+  const mvtOceanOnly = buildChunkWaterRaw({
+    waterFeatures: [
+      {
+        id: 'ocean-1',
+        kind: 'ocean',
+        isPolygon: true,
+        rings: [[[0, 0], [1, 0], [1, 1], [0, 1]]],
+      },
+    ],
+    elevationsM: flatOceanElev,
+    rows: 5,
+    cols: 5,
+    minElevationM: 0,
+    baseElevationM: -5,
+    metersToSceneY: 48 / 2400,
+    chunkWidth: 48,
+    chunkDepth: 48,
+    verticalExaggeration: 1.5,
+    isCoastalTile: true,
+  });
+  const withRedundantBay = buildChunkWaterRaw({
+    waterFeatures: [
+      {
+        id: 'ocean-1',
+        kind: 'ocean',
+        isPolygon: true,
+        rings: [[[0, 0], [1, 0], [1, 1], [0, 1]]],
+      },
+      {
+        id: 'bay-1',
+        kind: 'river',
+        isPolygon: true,
+        rings: [[[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]],
+      },
+    ],
+    elevationsM: flatOceanElev,
+    rows: 5,
+    cols: 5,
+    minElevationM: 0,
+    baseElevationM: -5,
+    metersToSceneY: 48 / 2400,
+    chunkWidth: 48,
+    chunkDepth: 48,
+    verticalExaggeration: 1.5,
+    isCoastalTile: true,
+  });
+
+  assertValidRawBuffers(coastalDemFallback, 'coastalDemFallback');
+  assertValidRawBuffers(mvtOceanOnly, 'mvtOceanOnly');
+  assertValidRawBuffers(withRedundantBay, 'withRedundantBay');
+  // Overlapping tidal bay/river polygons inside MVT ocean must NOT stack duplicate coplanar triangles
+  assert.equal(withRedundantBay!.indexCount, mvtOceanOnly!.indexCount);
+  // Open 0m ocean far from land must stay deep navy (>= 0.8), not shallow cyan (~0.11)
+  assert.ok(coastalDemFallback!.col[0] >= 0.8, `expected deep ocean depth >= 0.8, got ${coastalDemFallback!.col[0]}`);
+  assert.ok(mvtOceanOnly!.col[0] >= 0.8, `expected MVT ocean depth >= 0.8, got ${mvtOceanOnly!.col[0]}`);
+});
+
+test('buildAllChunkGeometriesRaw builds Tier-2 coastal ocean water when includeWater is enabled', () => {
+  const tier2Payload: TerrainChunkPayload = {
+    zoom: 12,
+    tx: 1110,
+    ty: 1777,
+    bounds: { north: 23.2, south: 23.1, east: -82.3, west: -82.4 },
+    spanMetersX: 9600,
+    spanMetersZ: 9600,
+    rows: 4,
+    cols: 4,
+    elevationsM: new Array<number>(16).fill(0),
+    minElevationM: 0,
+    maxElevationM: 0,
+    buildings: [],
+    roads: [],
+    waterFeatures: [],
+    demSource: 'terrarium-dem',
+    buildingsSource: 'none',
+  };
+
+  const out = buildAllChunkGeometriesRaw({
+    payload: tier2Payload,
+    baseElevationM: -5,
+    metersToSceneY: 48 / 2400,
+    chunkWidth: 192,
+    chunkDepth: 192,
+    verticalExaggeration: 1.5,
+    seedOffset: 1,
+    includeHoles: false,
+    includeRoadsAndWater: false,
+    includeWater: true,
+  });
+
+  assert.equal(out.stdGeo, null);
+  assert.equal(out.towerGeo, null);
+  assert.equal(out.roadsGeo, null);
+  assertValidRawBuffers(out.waterGeo, 'tier2.waterGeo');
+});
+
+test('carveCoastalWaterElevations depresses smeared harbor channel DEM while preserving high cliffs and land', () => {
+  // 5x5 grid with a narrow +2.2m/+16.5m smeared channel down the middle column (u=0.5) and +45m sea cliff at (row=0, col=2)
+  const elev = [
+    22, 34, 45, 34, 22,
+    10, 4, 16.5, 4, 10,
+    9, 3, 1.8, 3, 9,
+    9, 3, 2.4, 3, 9,
+    10, 5, 2.0, 5, 10,
+  ];
+  const harborPoly = {
+    id: 'harbor-channel',
+    kind: 'ocean' as const,
+    isPolygon: true,
+    rings: [
+      [
+        [0.42, -0.02],
+        [0.58, -0.02],
+        [0.58, 1.02],
+        [0.42, 1.02],
+      ] as Array<[number, number]>,
+    ],
+  };
+
+  const carved = carveCoastalWaterElevations(elev, 5, 5, [harborPoly]);
+  // +45m cliff stays untouched (> 32m maxCarveElevM)
+  assert.equal(carved[0 * 5 + 2], 45);
+  // Interior high land untouched; low 1-ring quay wall softened below raw +4m
+  assert.equal(carved[2 * 5 + 0], 9);
+  assert.ok(carved[2 * 5 + 1] <= 2.0 && carved[2 * 5 + 1] >= 1.2);
+  // Smeared channel vertices inside the harbor polygon (including +16.5m DSM smear) are carved to -4.5m
+  assert.equal(carved[1 * 5 + 2], -4.5);
+  assert.equal(carved[2 * 5 + 2], -4.5);
+  assert.equal(carved[3 * 5 + 2], -4.5);
+  assert.equal(carved[4 * 5 + 2], -4.5);
+});
+
+test('buildChunkWaterRaw clips buffered MVT ocean harbor polygons strictly inside chunk bounds and deduplicates inner docks', () => {
+  const elev = new Array<number>(5 * 5).fill(3.0);
+  // Depress center channel below sea level
+  for (let r = 0; r < 5; r++) elev[r * 5 + 2] = -2.2;
+
+  const water = buildChunkWaterRaw({
+    waterFeatures: [
+      {
+        id: 'harbor-ocean',
+        kind: 'ocean',
+        isPolygon: true,
+        rings: [
+          [
+            [0.35, -0.05],
+            [0.65, -0.05],
+            [0.65, 1.05],
+            [0.35, 1.05],
+          ],
+        ],
+      },
+      {
+        id: 'inner-dock-dup',
+        kind: 'lake',
+        isPolygon: true,
+        rings: [
+          [
+            [0.44, 0.3],
+            [0.56, 0.3],
+            [0.56, 0.5],
+            [0.44, 0.5],
+          ],
+        ],
+      },
+    ],
+    elevationsM: elev,
+    rows: 5,
+    cols: 5,
+    minElevationM: -2.2,
+    baseElevationM: -2.2,
+    metersToSceneY: 48 / 2400,
+    chunkWidth: 48,
+    chunkDepth: 48,
+    verticalExaggeration: 1.5,
+    isCoastalTile: true,
+  });
+
+  assertValidRawBuffers(water, 'harborWater');
+  // Every emitted vertex must stay strictly within [-chunkWidth/2..+chunkWidth/2] after unit-square clipping
+  for (let i = 0; i < water!.vertexCount; i++) {
+    const x = water!.pos[i * 3];
+    const z = water!.pos[i * 3 + 2];
+    assert.ok(x >= -24.0001 && x <= 24.0001, `x=${x} out of chunk bounds`);
+    assert.ok(z >= -24.0001 && z <= 24.0001, `z=${z} out of chunk bounds`);
+  }
 });

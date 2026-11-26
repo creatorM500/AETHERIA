@@ -1,4 +1,4 @@
-import { calculateBearingDeg, haversineKm, interpolateGreatCircle } from '../shared/geo.ts';
+import { calculateBearingDeg, clamp, haversineKm, interpolateGreatCircle } from '../shared/geo.ts';
 import { computeDynamicHeatScale } from '../shared/seismicHeat.ts';
 import type {
   EventCategory,
@@ -344,6 +344,19 @@ function decodeXmlEntities(text: string): string {
     .trim();
 }
 
+export function toIsoTimestampOrFallback(raw: unknown, fallbackMs: number): string {
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? new Date(raw).toISOString() : new Date(fallbackMs).toISOString();
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return new Date(fallbackMs).toISOString();
+    const parsedMs = Date.parse(trimmed);
+    return Number.isFinite(parsedMs) ? new Date(parsedMs).toISOString() : new Date(fallbackMs).toISOString();
+  }
+  return new Date(fallbackMs).toISOString();
+}
+
 async function fetchLiveUsgsEarthquakes(now: number): Promise<GlobalEvent[]> {
   // Use 2.5_day feed (~110ms) and sort newest + largest first
   const res = await fetchWithTimeout(
@@ -439,6 +452,20 @@ async function fetchLiveNasaEonet(now: number): Promise<GlobalEvent[]> {
           : catId.includes('ice')
             ? 'iceberg'
             : 'wildfire';
+    const windMatch = ev.title.match(/(\d+(?:\.\d+)?)\s*(km\/h|kmh|kts|kt|mph)/i);
+    let parsedWindKmh: number | undefined;
+    if (windMatch) {
+      const val = Number(windMatch[1]);
+      const unit = windMatch[2].toLowerCase();
+      if (Number.isFinite(val) && val > 0) {
+        parsedWindKmh = unit.startsWith('kt') ? Math.round(val * 1.852) : unit === 'mph' ? Math.round(val * 1.609) : Math.round(val);
+      }
+    }
+    const maxWindKmh = subtype === 'storm' ? parsedWindKmh ?? 105 : undefined;
+    const radiusKm =
+      subtype === 'storm'
+        ? Math.round(clamp(190 + (maxWindKmh ?? 105) * 1.15, 220, 500))
+        : 75;
     results.push({
       id: `eonet-${ev.id}`,
       category: 'disaster',
@@ -448,10 +475,12 @@ async function fetchLiveNasaEonet(now: number): Promise<GlobalEvent[]> {
       lat: Number(g.coordinates[1].toFixed(4)),
       lng: Number(g.coordinates[0].toFixed(4)),
       severity: subtype === 'storm' || subtype === 'volcano' ? 'high' : 'moderate',
+      maxWindKmh,
+      speedKts: maxWindKmh ? Math.round(maxWindKmh / 1.852) : undefined,
       timestamp: g.date ?? new Date(now).toISOString(),
       source: 'NASA EONET Live',
       summary: `Evento natural activo monitoreado por satélite (${ev.categories?.[0]?.title ?? subtype}).`,
-      radiusKm: subtype === 'storm' ? 200 : 75,
+      radiusKm,
     });
   }
   return results.slice(0, 10);
@@ -478,6 +507,11 @@ async function fetchLiveGdacsDisasters(now: number): Promise<GlobalEvent[]> {
         iscurrent?: string | boolean;
         todate?: string;
         fromdate?: string;
+        severitydata?: {
+          severity?: number | string;
+          severitytext?: string;
+          severityunit?: string;
+        };
       };
     }>;
   };
@@ -519,6 +553,38 @@ async function fetchLiveGdacsDisasters(now: number): Promise<GlobalEvent[]> {
       level === 'Red' ? 'critical' : level === 'Orange' ? 'high' : 'moderate';
     const levelLabel =
       level === 'Red' ? 'Alerta Roja' : level === 'Orange' ? 'Alerta Naranja' : 'Activo';
+
+    let maxWindKmh: number | undefined;
+    if (et === 'TC') {
+      const sevVal = Number(p.severitydata?.severity);
+      const sevUnit = String(p.severitydata?.severityunit ?? '').toLowerCase();
+      const sevText = String(p.severitydata?.severitytext ?? '');
+      if (Number.isFinite(sevVal) && sevVal > 0) {
+        maxWindKmh = Math.round(sevUnit.includes('kt') ? sevVal * 1.852 : sevVal);
+      } else {
+        const textMatch = sevText.match(/(\d+(?:\.\d+)?)\s*(km\/h|kts|kt|mph)/i);
+        if (textMatch) {
+          const val = Number(textMatch[1]);
+          const u = textMatch[2].toLowerCase();
+          maxWindKmh = Math.round(u.startsWith('kt') ? val * 1.852 : u === 'mph' ? val * 1.609 : val);
+        }
+      }
+      if (!maxWindKmh) {
+        maxWindKmh = level === 'Red' ? 185 : level === 'Orange' ? 115 : 72;
+      }
+    }
+
+    const radiusKm =
+      subtype === 'storm'
+        ? Math.round(
+            clamp(
+              185 + (maxWindKmh ?? 72) * 1.15 + (level === 'Red' ? 45 : level === 'Orange' ? 20 : 0),
+              210,
+              520
+            )
+          )
+        : 120;
+
     return {
       id: `gdacs-${et}-${p.eventid ?? idx}`,
       category: 'disaster' as const,
@@ -529,18 +595,21 @@ async function fetchLiveGdacsDisasters(now: number): Promise<GlobalEvent[]> {
       lat: Number(coords[1].toFixed(4)),
       lng: Number(coords[0].toFixed(4)),
       severity,
+      maxWindKmh,
+      speedKts: maxWindKmh ? Math.round(maxWindKmh / 1.852) : undefined,
       alertLevel: level,
       timestamp: p.todate ?? p.fromdate ?? new Date(now).toISOString(),
       source: 'GDACS Live Alert',
       summary: (p.htmldescription || p.description || 'Alerta activa en curso de desastre natural GDACS.')
         .replace(/<[^>]+>/g, '')
         .trim(),
-      radiusKm: subtype === 'storm' ? 230 : 120,
+      radiusKm,
       rawDetails: {
         gdacsEventId: p.eventid ?? null,
         eventType: et,
         fromDate: p.fromdate ?? null,
         toDate: p.todate ?? null,
+        severityText: p.severitydata?.severitytext ?? null,
       },
     };
   });
@@ -555,6 +624,7 @@ async function fetchLiveNhcCyclones(now: number): Promise<GlobalEvent[]> {
       name?: string;
       classification?: string;
       intensity?: string;
+      pressure?: string | number;
       latitudeNumeric?: number;
       longitudeNumeric?: number;
       movementDir?: number;
@@ -564,22 +634,37 @@ async function fetchLiveNhcCyclones(now: number): Promise<GlobalEvent[]> {
   };
   return (json.activeStorms ?? [])
     .filter((s) => typeof s.latitudeNumeric === 'number' && typeof s.longitudeNumeric === 'number')
-    .map((s, idx) => ({
-      id: `nhc-${s.id ?? idx}`,
-      category: 'disaster' as const,
-      subtype: 'storm',
-      title: `${s.classification ?? 'Ciclón'} ${s.name ?? 'Activo'}`,
-      region: 'NOAA National Hurricane Center',
-      lat: Number(s.latitudeNumeric!.toFixed(4)),
-      lng: Number(s.longitudeNumeric!.toFixed(4)),
-      severity: 'critical' as const,
-      speedKts: s.movementSpeed,
-      headingDeg: s.movementDir,
-      timestamp: s.lastUpdate ?? new Date(now).toISOString(),
-      source: 'NOAA NHC Live',
-      summary: `Vientos sostenidos de ${s.intensity ?? '—'} nudos monitoreados por NOAA NHC.`,
-      radiusKm: 260,
-    }));
+    .map((s, idx) => {
+      const intensityKts = Number(s.intensity);
+      const maxWindKmh =
+        Number.isFinite(intensityKts) && intensityKts > 0
+          ? Math.round(intensityKts * 1.852)
+          : 120;
+      const pressureVal = Number(s.pressure);
+      const centralPressureHpa =
+        Number.isFinite(pressureVal) && pressureVal >= 850 && pressureVal <= 1030
+          ? Math.round(pressureVal)
+          : undefined;
+      const radiusKm = Math.round(clamp(195 + maxWindKmh * 1.15, 220, 520));
+      return {
+        id: `nhc-${s.id ?? idx}`,
+        category: 'disaster' as const,
+        subtype: 'storm',
+        title: `${s.classification ?? 'Ciclón'} ${s.name ?? 'Activo'}`,
+        region: 'NOAA National Hurricane Center',
+        lat: Number(s.latitudeNumeric!.toFixed(4)),
+        lng: Number(s.longitudeNumeric!.toFixed(4)),
+        severity: 'critical' as const,
+        speedKts: Number.isFinite(intensityKts) && intensityKts > 0 ? intensityKts : s.movementSpeed,
+        maxWindKmh,
+        centralPressureHpa,
+        headingDeg: s.movementDir,
+        timestamp: s.lastUpdate ?? new Date(now).toISOString(),
+        source: 'NOAA NHC Live',
+        summary: `Vientos sostenidos de ${s.intensity ?? '—'} nudos${centralPressureHpa ? ` · presión central ${centralPressureHpa} hPa` : ''} monitoreados por NOAA NHC.`,
+        radiusKm,
+      };
+    });
 }
 
 interface AdsbAircraft {
@@ -687,9 +772,7 @@ async function fetchLiveAisVessels(now: number): Promise<GlobalEvent[]> {
       headingDeg: heading,
       speedKts,
       severity: 'low' as const,
-      timestamp: p.timestampExternal
-        ? new Date(p.timestampExternal).toISOString()
-        : json.dataUpdatedTime ?? new Date(now).toISOString(),
+      timestamp: toIsoTimestampOrFallback(p.timestampExternal ?? json.dataUpdatedTime, now),
       source: 'Digitraffic AIS Live',
       summary: `Buque real en navegación · ${speedKts} nudos · Rumbo ${heading}°`,
     };
@@ -714,7 +797,7 @@ async function fetchLiveConflictEnrichment(now: number): Promise<{
     const items = [...xml.matchAll(/<item>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?(?:<pubDate>([\s\S]*?)<\/pubDate>)?[\s\S]*?<\/item>/g)].map(
       (m) => ({
         title: decodeXmlEntities(m[1] ?? ''),
-        pubDate: m[2] ? new Date(decodeXmlEntities(m[2])).toISOString() : new Date(now).toISOString(),
+        pubDate: toIsoTimestampOrFallback(m[2] ? decodeXmlEntities(m[2]) : undefined, now),
       })
     );
 
