@@ -41,12 +41,15 @@ import {
   putPersistedTerrainChunk,
 } from '../utils/terrainIndexedDbCache.ts';
 
+import { planTerrainChunkEviction } from '../shared/memoryBudget.ts';
+
 const UNIT_TILE_WIDTH = 48; // 1 z=14 tile = 48 scene units (~2.4 km)
 const Z14_COUNT = 16384; // 2^14
 const Z12_COUNT = 4096; // 2^12
-const MAX_CONCURRENT_CHUNK_FETCHES = 10;
+const MAX_CONCURRENT_CHUNK_FETCHES = 6;
 const MAX_PAYLOAD_CACHE = 8;
-const MAX_GPU_CHUNKS = 60; // Tight ceiling (<500MB total budget) covering active core & outer hills
+const MAX_GPU_CHUNKS = 88; // Fits all 74 active tiles (49 Tier-1 + 25 Tier-2) + panning hysteresis under <500MB budget
+const _rayTestSphere = new THREE.Sphere();
 
 interface ActiveTerrainChunk {
   key: string;
@@ -94,6 +97,16 @@ interface FetchQueueItem {
   tx: number;
   ty: number;
   priority: number;
+  attempts?: number;
+}
+
+interface PendingChunkAttach {
+  key: string;
+  detailKey: string;
+  tier: 1 | 2;
+  dist2: number;
+  isCoreTile: boolean;
+  payload: TerrainChunkPayload;
 }
 
 /**
@@ -308,6 +321,8 @@ export class GlobalTerrainStreamManager {
   private fetchQueue: FetchQueueItem[] = [];
   private queuedKeys = new Set<string>();
   private inflightControllers = new Map<string, AbortController>();
+  private retryTimers = new Set<number>();
+  private pendingAttachQueue: PendingChunkAttach[] = [];
   private buildQueue: string[] = [];
   private activeWorkerBuilds = 0;
 
@@ -439,6 +454,7 @@ export class GlobalTerrainStreamManager {
     this.clearActiveChunks();
     this.payloadCache.clear();
     this.cancelAllFetches();
+    this.pendingAttachQueue = [];
     this.buildQueue = [];
     this.sessionBaseElevM = null;
     this.anchorSignaled = false;
@@ -559,6 +575,14 @@ export class GlobalTerrainStreamManager {
   public raycastTerrain(raycaster: THREE.Raycaster): { point: THREE.Vector3; lat: number; lng: number } | null {
     const targets: THREE.Object3D[] = [];
     for (const chunk of this.activeChunks.values()) {
+      const bs = chunk.terrainGeo.boundingSphere;
+      if (bs) {
+        _rayTestSphere.copy(bs);
+        _rayTestSphere.center.add(chunk.group.position);
+        if (!raycaster.ray.intersectsSphere(_rayTestSphere)) {
+          continue;
+        }
+      }
       targets.push(chunk.terrainMesh);
     }
     if (targets.length === 0) return null;
@@ -897,33 +921,75 @@ export class GlobalTerrainStreamManager {
     };
   }
 
-  public pruneTerrainCaches(keepMaxChunks: number) {
+  public pruneTerrainCaches(keepMaxChunks: number, allowDowngradeOuterTier1 = false) {
     const safeKeep = Math.max(0, Math.floor(keepMaxChunks));
     while (this.payloadCache.size > 2) {
       const oldest = this.payloadCache.keys().next().value;
       if (!oldest) break;
       this.payloadCache.delete(oldest);
     }
+
+    for (const chunk of this.activeChunks.values()) {
+      if (!chunk.buildingsPending && !chunk.workerBuilding) {
+        this.pruneChunkVectorPayload(chunk);
+      }
+    }
+
     if (this.activeChunks.size <= safeKeep) return;
 
-    const candidates = Array.from(this.activeChunks.values())
-      .filter((c) => !this.desiredKeys.has(c.key) || !c.isCoreTile)
-      .sort((a, b) => a.lastUsedMs - b.lastUsedMs);
+    const candidates = Array.from(this.activeChunks.values()).map((c) => ({
+      key: c.key,
+      tier: c.tier,
+      tx: c.tx,
+      ty: c.ty,
+      isCoreTile: c.isCoreTile,
+      dist2: c.dist2,
+      lastUsedMs: c.lastUsedMs,
+      desired: this.desiredKeys.has(c.key),
+      hasVectorMeshes: Boolean(c.stdMesh || c.towerMesh),
+    }));
 
-    for (const victim of candidates) {
-      if (this.activeChunks.size <= safeKeep) break;
-      this.disposeChunk(victim);
-      this.activeChunks.delete(victim.key);
-      this.desiredKeys.delete(victim.key);
+    const plan = planTerrainChunkEviction(candidates, safeKeep, allowDowngradeOuterTier1);
+    const evictSet = new Set(plan.evictKeys);
+
+    for (const key of plan.stripVectorMeshKeys) {
+      if (evictSet.has(key)) continue;
+      const chunk = this.activeChunks.get(key);
+      if (!chunk || chunk.workerBuilding) continue;
+      if (chunk.stdMesh) {
+        chunk.stdMesh.geometry.dispose();
+        chunk.group.remove(chunk.stdMesh);
+        chunk.stdMesh = null;
+      }
+      if (chunk.towerMesh) {
+        chunk.towerMesh.geometry.dispose();
+        chunk.group.remove(chunk.towerMesh);
+        chunk.towerMesh = null;
+      }
+      chunk.buildingsBuilt = 0;
+      chunk.buildingsPending = false;
     }
-    this.buildQueue = this.buildQueue.filter((key) => this.activeChunks.has(key));
-    this.refreshTier1Mask();
+
+    for (const key of plan.evictKeys) {
+      const victim = this.activeChunks.get(key);
+      if (!victim) continue;
+      this.disposeChunk(victim);
+      this.activeChunks.delete(key);
+      this.desiredKeys.delete(key);
+    }
+
+    if (plan.evictKeys.length > 0 || plan.stripVectorMeshKeys.length > 0) {
+      this.buildQueue = this.buildQueue.filter((key) => this.activeChunks.has(key));
+      this.refreshTier1Mask();
+      this.emitCurrentStats(true);
+    }
   }
 
   public trimMemory(aggressive = false) {
     this.payloadCache.clear();
     trimTileCanvasCaches(0);
     this.cancelAllFetches();
+    this.pendingAttachQueue = [];
     this.lastCenterKey = '';
 
     for (const [key, chunk] of Array.from(this.activeChunks.entries())) {
@@ -1146,6 +1212,7 @@ export class GlobalTerrainStreamManager {
       }
     }
 
+    this.pendingAttachQueue = this.pendingAttachQueue.filter((p) => nextDesired.has(p.key));
     this.fetchQueue = this.fetchQueue.filter((q) => nextDesired.has(q.key));
     this.queuedKeys.clear();
     for (const q of this.fetchQueue) this.queuedKeys.add(q.key);
@@ -1173,6 +1240,29 @@ export class GlobalTerrainStreamManager {
     this.emitCurrentStats(true);
   }
 
+  private scheduleChunkRetry(spec: FetchQueueItem) {
+    const attempts = (spec.attempts ?? 0) + 1;
+    if (attempts > 3 || this.disposed || !this.desiredKeys.has(spec.key)) return;
+    const delayMs = 550 * attempts;
+    const timer = window.setTimeout(() => {
+      this.retryTimers.delete(timer);
+      if (
+        this.disposed ||
+        !this.desiredKeys.has(spec.key) ||
+        this.activeChunks.has(spec.key) ||
+        this.inflightControllers.has(spec.key) ||
+        this.queuedKeys.has(spec.key)
+      ) {
+        return;
+      }
+      this.fetchQueue.push({ ...spec, attempts });
+      this.fetchQueue.sort((a, b) => a.priority - b.priority);
+      this.queuedKeys.add(spec.key);
+      this.pumpFetchQueue();
+    }, delayMs);
+    this.retryTimers.add(timer);
+  }
+
   private pumpFetchQueue() {
     while (
       this.inflightControllers.size < MAX_CONCURRENT_CHUNK_FETCHES &&
@@ -1195,13 +1285,17 @@ export class GlobalTerrainStreamManager {
       const idbKey = `v4:${detailKey}`;
 
       void (async () => {
+        let shouldRetry = false;
         try {
           let payload = await getPersistedTerrainChunk(idbKey);
           if (this.disposed || controller.signal.aborted) return;
 
           if (!payload) {
             const res = await fetch(url, { signal: controller.signal });
-            if (!res.ok) return;
+            if (!res.ok) {
+              shouldRetry = !controller.signal.aborted;
+              return;
+            }
             payload = (await res.json()) as TerrainChunkPayload;
             if (this.disposed || controller.signal.aborted) return;
             void putPersistedTerrainChunk(idbKey, payload);
@@ -1214,22 +1308,48 @@ export class GlobalTerrainStreamManager {
           this.payloadCache.set(detailKey, payload);
 
           if (this.desiredKeys.has(spec.key) && !this.activeChunks.has(spec.key)) {
-            this.attachChunkFromPayload(
-              spec.key,
+            this.enqueueChunkAttach({
+              key: spec.key,
               detailKey,
-              spec.tier,
-              spec.dist2,
-              spec.isCoreTile,
-              payload
-            );
+              tier: spec.tier,
+              dist2: spec.dist2,
+              isCoreTile: spec.isCoreTile,
+              payload,
+            });
           }
         } catch {
-          // Ignore transient or aborted fetch errors
+          if (!this.disposed && !controller.signal.aborted) {
+            shouldRetry = true;
+          }
         } finally {
           this.inflightControllers.delete(spec.key);
+          if (shouldRetry && !this.disposed && this.desiredKeys.has(spec.key)) {
+            this.scheduleChunkRetry(spec);
+          }
           this.pumpFetchQueue();
         }
       })();
+    }
+  }
+
+  private enqueueChunkAttach(item: PendingChunkAttach) {
+    if (this.disposed || this.activeChunks.has(item.key)) return;
+    // Attach very first center chunk immediately so onAnchorReady positions camera without delay
+    if (!this.anchorSignaled && item.tier === 1 && item.dist2 === 0) {
+      this.attachChunkFromPayload(
+        item.key,
+        item.detailKey,
+        item.tier,
+        item.dist2,
+        item.isCoreTile,
+        item.payload
+      );
+      return;
+    }
+    if (!this.pendingAttachQueue.some((p) => p.key === item.key)) {
+      this.pendingAttachQueue.push(item);
+      this.pendingAttachQueue.sort((a, b) => (a.tier - b.tier) * 20 + (a.dist2 - b.dist2));
+      this.onAssetUpdated?.();
     }
   }
 
@@ -1301,9 +1421,12 @@ export class GlobalTerrainStreamManager {
     const hasRoads = Boolean(payload.roads?.length);
     const hasBuildings = payload.buildings.length > 0;
     const hasWaterSurface = payload.minElevationM <= 0.42 || hasWaterFeatures;
+    // Keep only core tiles' immediate water/roads synchronous; offload outer & Tier-2 water to Worker pool
     const hasImmediateNonBuilding =
-      hasWaterSurface || (tier === 1 && !hasBuildings && hasRoads);
-    const needsTier1WorkerBuild = tier === 1 && hasBuildings;
+      isCoreTile && (hasWaterSurface || (tier === 1 && !hasBuildings && hasRoads));
+    const needsWorkerBuild =
+      (tier === 1 && (hasBuildings || (!isCoreTile && (hasWaterSurface || hasRoads)))) ||
+      (tier === 2 && hasWaterSurface);
 
     const chunk: ActiveTerrainChunk = {
       key,
@@ -1334,7 +1457,7 @@ export class GlobalTerrainStreamManager {
       builtExaggeration: this.verticalExaggeration,
       builtWaterExaggeration: hasWaterSurface ? this.verticalExaggeration : -1,
       buildingsBuilt: 0,
-      buildingsPending: needsTier1WorkerBuild,
+      buildingsPending: needsWorkerBuild,
       needsRehydrate: false,
       workerBuilding: false,
       buildEpoch: 1,
@@ -1417,6 +1540,7 @@ export class GlobalTerrainStreamManager {
   public hasPendingWork(): boolean {
     return (
       this.inflightControllers.size > 0 ||
+      this.pendingAttachQueue.length > 0 ||
       this.buildQueue.length > 0 ||
       this.activeWorkerBuilds > 0
     );
@@ -1495,7 +1619,31 @@ export class GlobalTerrainStreamManager {
    * to the background Web Worker pool (transferring zero-copy TypedArrays) with main-thread fallback.
    */
   public stepFrame() {
-    if (this.disposed || this.buildQueue.length === 0) return;
+    if (this.disposed) return;
+
+    // Time-budgeted chunk attachment (<=7ms/frame) avoids burst stutters on fast GPUs while preventing slow Tier-2 fill on low-FPS devices
+    const maxAttachPerFrame = this.isSoftwareGl ? 6 : 4;
+    const attachStartMs = performance.now();
+    let attachedThisFrame = 0;
+    while (this.pendingAttachQueue.length > 0 && attachedThisFrame < maxAttachPerFrame) {
+      if (attachedThisFrame >= 1 && performance.now() - attachStartMs >= 7) {
+        break;
+      }
+      const next = this.pendingAttachQueue.shift()!;
+      if (this.desiredKeys.has(next.key) && !this.activeChunks.has(next.key)) {
+        this.attachChunkFromPayload(
+          next.key,
+          next.detailKey,
+          next.tier,
+          next.dist2,
+          next.isCoreTile,
+          next.payload
+        );
+        attachedThisFrame += 1;
+      }
+    }
+
+    if (this.buildQueue.length === 0) return;
 
     let currentTotalBuildings = 0;
     for (const c of this.activeChunks.values()) {
@@ -1591,11 +1739,14 @@ export class GlobalTerrainStreamManager {
       demSource = c.payload.demSource;
     }
 
-    const loading = this.inflightControllers.size > 0 || this.buildQueue.length > 0;
+    const loading =
+      this.inflightControllers.size > 0 ||
+      this.pendingAttachQueue.length > 0 ||
+      this.buildQueue.length > 0;
     const stage: TerrainHudStats['stage'] =
       totalChunks === 0 && loading
         ? 'dem'
-        : this.buildQueue.length > 0
+        : this.buildQueue.length > 0 || this.pendingAttachQueue.length > 0
           ? 'buildings'
           : 'ready';
 
@@ -1636,6 +1787,10 @@ export class GlobalTerrainStreamManager {
   }
 
   private cancelAllFetches() {
+    for (const timer of this.retryTimers) {
+      window.clearTimeout(timer);
+    }
+    this.retryTimers.clear();
     for (const ctrl of this.inflightControllers.values()) {
       ctrl.abort();
     }

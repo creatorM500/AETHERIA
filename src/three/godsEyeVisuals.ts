@@ -189,7 +189,8 @@ export function applyGodsEyeTerrainShader(
         #include <opaque_fragment>`
       );
   };
-  material.customProgramCacheKey = () => 'godseye-terrain-v4';
+  material.customProgramCacheKey = () =>
+    tier1Mask ? 'godseye-terrain-v4-masked' : 'godseye-terrain-v4';
 }
 
 /**

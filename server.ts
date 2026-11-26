@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { decodeEncodedPolyline } from './src/shared/geo.ts';
 import {
@@ -136,6 +137,35 @@ function enforceServerMemoryBudget() {
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
+  app.use('/api', (req, res, next) => {
+    const accept = String(req.headers['accept-encoding'] ?? '');
+    if (!accept.includes('gzip')) {
+      next();
+      return;
+    }
+    const origJson = res.json.bind(res);
+    res.json = ((body: unknown) => {
+      const jsonStr = JSON.stringify(body);
+      if (jsonStr.length < 2048 || res.headersSent) {
+        if (!res.headersSent) {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        }
+        return res.send(jsonStr);
+      }
+      zlib.gzip(Buffer.from(jsonStr, 'utf8'), { level: 4 }, (err, compressed) => {
+        if (err || res.headersSent) {
+          if (!res.headersSent) origJson(body);
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Vary', 'Accept-Encoding');
+        res.send(compressed);
+      });
+      return res;
+    }) as typeof res.json;
+    next();
+  });
 
   const watchdogTimer = setInterval(() => {
     enforceServerMemoryBudget();
@@ -289,6 +319,7 @@ async function startServer() {
         maxBuildings: maxBuildings && Number.isFinite(maxBuildings) ? maxBuildings : undefined,
         includeBuildings,
       });
+      res.setHeader('Cache-Control', 'public, max-age=1800, stale-while-revalidate=3600');
       res.json(chunk);
       enforceServerMemoryBudget();
     } catch (error) {
@@ -300,6 +331,7 @@ async function startServer() {
   app.get('/api/terrain/planet-dem', async (_req, res) => {
     try {
       const dem = await getPlanetaryDemGrid();
+      res.setHeader('Cache-Control', 'public, max-age=3600');
       res.json(dem);
     } catch (error) {
       console.error('Planet DEM error:', error);

@@ -298,7 +298,7 @@ export function getQualitySpecForTier(tier: QualityTier, isSoftwareGl: boolean, 
       demGridSize: 65,
       maxBuildings: 16000,
       textureSize: 1280,
-      pixelRatioCap: Math.min(dpr, 1.5),
+      pixelRatioCap: Math.min(dpr, 1.25),
       shadowsEnabled: true,
     };
   }
@@ -307,7 +307,7 @@ export function getQualitySpecForTier(tier: QualityTier, isSoftwareGl: boolean, 
     demGridSize: 81,
     maxBuildings: 18000,
     textureSize: 1536,
-    pixelRatioCap: Math.min(dpr, 2),
+    pixelRatioCap: Math.min(dpr, 1.5),
     shadowsEnabled: true,
   };
 }

@@ -6,10 +6,13 @@ import {
   computePruneEvictionCount,
   estimateClientFootprintMb,
   evaluateMemoryBudget,
+  getCoveringTier2Key,
   HARD_MEMORY_CEILING_MB,
+  planTerrainChunkEviction,
   selectLruEvictionKeys,
   SERVER_HARD_PRUNE_MB,
   SERVER_SOFT_PRUNE_MB,
+  type TerrainChunkEvictionCandidate,
 } from './memoryBudget.ts';
 
 test('evaluateMemoryBudget classifies normal, soft, and critical pressure below 500 MB ceiling', () => {
@@ -79,3 +82,79 @@ test('selectLruEvictionKeys evicts oldest unprotected entries first', () => {
   const victims = selectLruEvictionKeys(entries, 3, (_k, v) => Boolean(v.core));
   assert.deepEqual(victims, ['k2', 'k4']);
 });
+
+test('planTerrainChunkEviction never evicts active Tier-2 horizon tiles or uncovered Tier-1 tiles', () => {
+  assert.equal(getCoveringTier2Key(5016, 7360), '12/1254/1840');
+
+  const chunks: TerrainChunkEvictionCandidate[] = [
+    {
+      key: '14/5000/7300',
+      tier: 1,
+      tx: 5000,
+      ty: 7300,
+      isCoreTile: false,
+      dist2: 18,
+      lastUsedMs: 10,
+      desired: false,
+      hasVectorMeshes: true,
+    },
+    {
+      key: '14/5016/7360',
+      tier: 1,
+      tx: 5016,
+      ty: 7360,
+      isCoreTile: true,
+      dist2: 0,
+      lastUsedMs: 50,
+      desired: true,
+      hasVectorMeshes: true,
+    },
+    {
+      key: '14/5019/7363',
+      tier: 1,
+      tx: 5019,
+      ty: 7363,
+      isCoreTile: false,
+      dist2: 18,
+      lastUsedMs: 20,
+      desired: true,
+      hasVectorMeshes: true,
+    },
+    {
+      key: '14/5020/7364',
+      tier: 1,
+      tx: 5020,
+      ty: 7364,
+      isCoreTile: false,
+      dist2: 20,
+      lastUsedMs: 15,
+      desired: true,
+      hasVectorMeshes: true,
+    },
+    {
+      key: '12/1254/1840',
+      tier: 2,
+      tx: 1254,
+      ty: 1840,
+      isCoreTile: false,
+      dist2: 0,
+      lastUsedMs: 30,
+      desired: true,
+      hasVectorMeshes: false,
+    },
+  ];
+
+  // Soft prune only drops stale off-viewport tiles, never desired visible tiles
+  const softPlan = planTerrainChunkEviction(chunks, 3, false);
+  assert.deepEqual(softPlan.evictKeys, ['14/5000/7300']);
+  assert.deepEqual(softPlan.stripVectorMeshKeys, []);
+
+  // Critical prune strips outer vector meshes and ONLY drops outer Tier-1 covered by Tier-2 (12/1254/1840 -> covers 5019/7363, NOT 5020/7364)
+  const criticalPlan = planTerrainChunkEviction(chunks, 2, true);
+  assert.deepEqual(criticalPlan.evictKeys, ['14/5000/7300', '14/5019/7363']);
+  assert.ok(!criticalPlan.evictKeys.includes('12/1254/1840'));
+  assert.ok(!criticalPlan.evictKeys.includes('14/5016/7360'));
+  assert.ok(!criticalPlan.evictKeys.includes('14/5020/7364'));
+  assert.deepEqual(criticalPlan.stripVectorMeshKeys, ['14/5020/7364', '14/5019/7363']);
+});
+

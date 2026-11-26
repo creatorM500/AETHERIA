@@ -565,8 +565,18 @@ async function fetchVectorTileWithFallback(
       headers: { 'User-Agent': 'AetheriaGlobal/1.0' },
       signal: AbortSignal.timeout(5000),
     });
+    if (res.status === 204) {
+      const empty: ParsedVectorTileBundle = { buildings: [], roads: [], waterFeatures: [] };
+      setLru(mvtTileBundleCache, key, empty, 20 * 60 * 1000, 56);
+      return { bundle: empty, source: 'none' };
+    }
     if (res.ok) {
       const buf = new Uint8Array(await res.arrayBuffer());
+      if (buf.length < 32) {
+        const empty: ParsedVectorTileBundle = { buildings: [], roads: [], waterFeatures: [] };
+        setLru(mvtTileBundleCache, key, empty, 20 * 60 * 1000, 56);
+        return { bundle: empty, source: 'none' };
+      }
       const parsed = parseVectorTileBundle(buf, 'versatiles', key);
       if (
         parsed.buildings.length > 0 ||
@@ -576,6 +586,8 @@ async function fetchVectorTileWithFallback(
         setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 56);
         return { bundle: parsed, source: 'versatiles-osm' };
       }
+      setLru(mvtTileBundleCache, key, parsed, 15 * 60 * 1000, 56);
+      return { bundle: parsed, source: 'none' };
     }
   } catch {
     // Fall through to OpenFreeMap

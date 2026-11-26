@@ -144,3 +144,112 @@ export function selectLruEvictionKeys<T extends { lastUsedMs?: number }>(
   }
   return victims;
 }
+
+export interface TerrainChunkEvictionCandidate {
+  key: string;
+  tier: 1 | 2;
+  tx: number;
+  ty: number;
+  isCoreTile: boolean;
+  dist2: number;
+  lastUsedMs: number;
+  desired: boolean;
+  hasVectorMeshes: boolean;
+}
+
+export interface TerrainChunkEvictionPlan {
+  stripVectorMeshKeys: string[];
+  evictKeys: string[];
+}
+
+const Z12_TILE_COUNT = 4096;
+
+export function getCoveringTier2Key(tx14: number, ty14: number): string {
+  const parentTx12 = ((Math.floor(tx14 / 4) % Z12_TILE_COUNT) + Z12_TILE_COUNT) % Z12_TILE_COUNT;
+  const parentTy12 = clamp(Math.floor(ty14 / 4), 0, Z12_TILE_COUNT - 1);
+  return `12/${parentTx12}/${parentTy12}`;
+}
+
+/**
+ * Plans terrain chunk memory eviction without ever punching voids inside the active
+ * Terreno 3D grid:
+ * 1) Always evict non-desired (off-viewport) chunks oldest-first.
+ * 2) When outer downgrade is permitted under critical pressure, strip building/road
+ *    sub-meshes on farthest non-core Tier-1 tiles first before dropping ground tiles.
+ * 3) Only evict farthest non-core desired Tier-1 tiles if their covering Tier-2 (z=12)
+ *    horizon chunk is already loaded underneath so the Tier-1 mask reveals terrain cleanly.
+ *    Desired Tier-2 horizon chunks and core Tier-1 chunks are never evicted.
+ */
+export function planTerrainChunkEviction(
+  chunks: ReadonlyArray<TerrainChunkEvictionCandidate>,
+  keepMaxChunks: number,
+  allowDowngradeOuterTier1 = false
+): TerrainChunkEvictionPlan {
+  const safeKeep = Math.max(0, Math.floor(keepMaxChunks));
+  const evictKeys: string[] = [];
+  const stripVectorMeshKeys: string[] = [];
+
+  if (chunks.length <= safeKeep) {
+    return { stripVectorMeshKeys, evictKeys };
+  }
+
+  let remaining = chunks.length;
+  const evictedSet = new Set<string>();
+
+  // Pass 1: Evict stale off-viewport chunks first (oldest lastUsedMs first)
+  const offViewport = chunks
+    .filter((c) => !c.desired)
+    .slice()
+    .sort((a, b) => a.lastUsedMs - b.lastUsedMs);
+
+  for (const c of offViewport) {
+    if (remaining <= safeKeep) break;
+    evictKeys.push(c.key);
+    evictedSet.add(c.key);
+    remaining -= 1;
+  }
+
+  if (remaining <= safeKeep || !allowDowngradeOuterTier1) {
+    return { stripVectorMeshKeys, evictKeys };
+  }
+
+  // Pass 2: Strip heavy building/road meshes on farthest outer non-core Tier-1 chunks
+  const outerWithBuildings = chunks
+    .filter((c) => !evictedSet.has(c.key) && c.tier === 1 && !c.isCoreTile && c.hasVectorMeshes)
+    .slice()
+    .sort((a, b) => b.dist2 - a.dist2 || a.lastUsedMs - b.lastUsedMs);
+
+  for (const c of outerWithBuildings) {
+    stripVectorMeshKeys.push(c.key);
+  }
+
+  // Pass 3: Under critical pressure, only evict outer non-core Tier-1 chunks that have a
+  // loaded Tier-2 chunk directly underneath (never evict desired Tier-2 or core Tier-1).
+  const loadedTier2Keys = new Set<string>();
+  for (const c of chunks) {
+    if (!evictedSet.has(c.key) && c.tier === 2) {
+      loadedTier2Keys.add(c.key);
+    }
+  }
+
+  const coveredOuterTier1 = chunks
+    .filter(
+      (c) =>
+        !evictedSet.has(c.key) &&
+        c.tier === 1 &&
+        !c.isCoreTile &&
+        loadedTier2Keys.has(getCoveringTier2Key(c.tx, c.ty))
+    )
+    .slice()
+    .sort((a, b) => b.dist2 - a.dist2 || a.lastUsedMs - b.lastUsedMs);
+
+  for (const c of coveredOuterTier1) {
+    if (remaining <= safeKeep) break;
+    evictKeys.push(c.key);
+    evictedSet.add(c.key);
+    remaining -= 1;
+  }
+
+  return { stripVectorMeshKeys, evictKeys };
+}
+

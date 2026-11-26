@@ -344,7 +344,7 @@ export function GlobeWebGLCanvas({
     renderer.setPixelRatio(activeQualitySpec.pixelRatioCap);
     renderer.setSize(width, height);
     renderer.shadowMap.enabled = activeQualitySpec.shadowsEnabled;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
@@ -381,12 +381,12 @@ export function GlobeWebGLCanvas({
     keyLight.position.set(42, 48, 34);
     if (!isSoftwareGl) {
       keyLight.castShadow = true;
-      keyLight.shadow.mapSize.set(2048, 2048);
-      keyLight.shadow.camera.left = -56;
-      keyLight.shadow.camera.right = 56;
-      keyLight.shadow.camera.top = 56;
-      keyLight.shadow.camera.bottom = -56;
-      keyLight.shadow.bias = -0.0004;
+      keyLight.shadow.mapSize.set(1024, 1024);
+      keyLight.shadow.camera.left = -48;
+      keyLight.shadow.camera.right = 48;
+      keyLight.shadow.camera.top = 48;
+      keyLight.shadow.camera.bottom = -48;
+      keyLight.shadow.bias = -0.0005;
       keyLight.shadow.normalBias = 0.03;
     }
     scene.add(keyLight);
@@ -996,19 +996,19 @@ export function GlobeWebGLCanvas({
 
       if (forceAggressive || budget.pressure === 'critical') {
         trimTileCanvasCaches(0);
-        regionalTiles.pruneCache(propsRef.current.viewportMode === 'globe' ? 18 : 6);
+        regionalTiles.pruneCache(propsRef.current.viewportMode === 'globe' ? 18 : 2);
         if (propsRef.current.viewportMode !== 'sector3d') {
           terrainStream?.trimMemory(true);
         } else {
-          terrainStream?.pruneTerrainCaches(36);
+          terrainStream?.pruneTerrainCaches(56, true);
         }
       } else {
-        trimTileCanvasCaches(1 - budget.pruneFraction);
-        regionalTiles.pruneCache(propsRef.current.viewportMode === 'globe' ? 36 : 12);
+        trimTileCanvasCaches(0);
+        regionalTiles.pruneCache(propsRef.current.viewportMode === 'globe' ? 36 : 4);
         if (propsRef.current.viewportMode !== 'sector3d') {
           terrainStream?.trimMemory(false);
         } else {
-          terrainStream?.pruneTerrainCaches(48);
+          terrainStream?.pruneTerrainCaches(76, false);
         }
       }
     };
@@ -1841,9 +1841,9 @@ export function GlobeWebGLCanvas({
         syncModeLighting(activeTexMode, propsRef.current.viewportMode, transition.terminatorMix);
       }
 
-      if (!isSoftwareGl && rawFrameMs > 2 && rawFrameMs < 160 && propsRef.current.qualityPreference === 'auto') {
-        smoothedFrameMs = smoothedFrameMs * 0.92 + rawFrameMs * 0.08;
-        if (now - lastQualityEvalMs > 3200) {
+      if (!isSoftwareGl && rawFrameMs > 2 && rawFrameMs < 350 && propsRef.current.qualityPreference === 'auto') {
+        smoothedFrameMs = smoothedFrameMs * 0.88 + rawFrameMs * 0.12;
+        if (now - lastQualityEvalMs > 1500) {
           lastQualityEvalMs = now;
           const stepped = stepAdaptiveQualityTier(currentQualityTier, smoothedFrameMs, isSoftwareGl);
           if (stepped !== currentQualityTier) {
