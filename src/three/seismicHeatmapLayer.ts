@@ -25,27 +25,40 @@ const _color = new THREE.Color();
 export class GlobeSeismicHeatmapLayer {
   public readonly group = new THREE.Group();
   private globeRadius: number;
-  private heatTex: THREE.DataTexture;
-  private shellGeo: THREE.SphereGeometry;
-  private shellMat: THREE.ShaderMaterial;
-  private shellMesh: THREE.Mesh;
+  private isSoftwareGl: boolean;
+  private heatTex: THREE.DataTexture | null = null;
+  private shellGeo: THREE.SphereGeometry | null = null;
+  private shellMat: THREE.ShaderMaterial | null = null;
+  private shellMesh: THREE.Mesh | null = null;
 
-  private pinGeo: THREE.CylinderGeometry;
-  private pinMat: THREE.MeshBasicMaterial;
-  private pinMesh: THREE.InstancedMesh;
+  private pinGeo: THREE.CylinderGeometry | null = null;
+  private pinMat: THREE.MeshBasicMaterial | null = null;
+  private pinMesh: THREE.InstancedMesh | null = null;
 
-  private ringGeo: THREE.RingGeometry;
-  private ringMat: THREE.MeshBasicMaterial;
-  private ringMesh: THREE.InstancedMesh;
+  private ringGeo: THREE.RingGeometry | null = null;
+  private ringMat: THREE.MeshBasicMaterial | null = null;
+  private ringMesh: THREE.InstancedMesh | null = null;
 
   private normalizedPoints: NormalizedHeatPoint[] = [];
   private pinQuakes: SeismicQuake24h[] = [];
   private ringQuakes: SeismicQuake24h[] = [];
-  private enabled = true;
+  private enabled = false;
+  private allocated = false;
+  private dirtyRaster = false;
   private lastAltitude = 16;
 
   constructor(globeRadius: number, isSoftwareGl: boolean) {
     this.globeRadius = globeRadius;
+    this.isSoftwareGl = isSoftwareGl;
+    this.group.visible = false;
+  }
+
+  public isAllocated(): boolean {
+    return this.allocated;
+  }
+
+  private ensureAllocated() {
+    if (this.allocated) return;
 
     const emptyField = new Uint8Array(HEAT_TEX_W * HEAT_TEX_H);
     this.heatTex = new THREE.DataTexture(emptyField, HEAT_TEX_W, HEAT_TEX_H, THREE.RedFormat);
@@ -58,9 +71,9 @@ export class GlobeSeismicHeatmapLayer {
     this.heatTex.needsUpdate = true;
 
     this.shellGeo = new THREE.SphereGeometry(
-      globeRadius + 0.048,
-      isSoftwareGl ? 128 : 160,
-      isSoftwareGl ? 96 : 120
+      this.globeRadius + 0.048,
+      this.isSoftwareGl ? 128 : 160,
+      this.isSoftwareGl ? 96 : 120
     );
 
     this.shellMat = new THREE.ShaderMaterial({
@@ -175,26 +188,77 @@ export class GlobeSeismicHeatmapLayer {
     this.ringMesh.renderOrder = 5;
 
     this.group.add(this.pinMesh, this.ringMesh);
+    this.allocated = true;
+  }
+
+  public releaseIdleMemory() {
+    if (this.enabled || !this.allocated) return;
+    if (this.shellMesh) this.group.remove(this.shellMesh);
+    if (this.pinMesh) this.group.remove(this.pinMesh);
+    if (this.ringMesh) this.group.remove(this.ringMesh);
+    this.heatTex?.dispose();
+    this.shellGeo?.dispose();
+    this.shellMat?.dispose();
+    this.pinGeo?.dispose();
+    this.pinMat?.dispose();
+    this.ringGeo?.dispose();
+    this.ringMat?.dispose();
+    this.heatTex = null;
+    this.shellGeo = null;
+    this.shellMat = null;
+    this.shellMesh = null;
+    this.pinGeo = null;
+    this.pinMat = null;
+    this.pinMesh = null;
+    this.ringGeo = null;
+    this.ringMat = null;
+    this.ringMesh = null;
+    this.pinQuakes = [];
+    this.ringQuakes = [];
+    this.dirtyRaster = this.normalizedPoints.length > 0;
+    this.allocated = false;
+    this.group.visible = false;
+  }
+
+  private rasterizeIntoTexture() {
+    if (!this.heatTex) return;
+    const { field } = rasterizeEquirectangularHeatField(
+      this.normalizedPoints,
+      HEAT_TEX_W,
+      HEAT_TEX_H
+    );
+    const texData = this.heatTex.image.data as Uint8Array;
+    texData.set(field);
+    this.heatTex.needsUpdate = true;
+    this.syncInstances(this.lastAltitude);
+    this.dirtyRaster = false;
   }
 
   public setEnabled(enabled: boolean) {
     this.enabled = enabled;
-    this.group.visible = enabled;
+    if (enabled) {
+      this.ensureAllocated();
+      if (this.dirtyRaster && this.normalizedPoints.length > 0) {
+        this.rasterizeIntoTexture();
+      }
+      this.group.visible = true;
+    } else {
+      this.group.visible = false;
+      this.releaseIdleMemory();
+    }
   }
 
   public setData(quakes: SeismicQuake24h[], metrics: SeismicHeatScaleMetrics) {
     const normalized = normalizeQuakesForDynamicHeat(quakes, metrics);
     this.normalizedPoints = normalized;
-
-    const { field } = rasterizeEquirectangularHeatField(normalized, HEAT_TEX_W, HEAT_TEX_H);
-    const texData = this.heatTex.image.data as Uint8Array;
-    texData.set(field);
-    this.heatTex.needsUpdate = true;
-
-    this.syncInstances(this.lastAltitude);
+    this.dirtyRaster = true;
+    if (!this.enabled) return;
+    this.ensureAllocated();
+    this.rasterizeIntoTexture();
   }
 
   private syncInstances(altitude: number) {
+    if (!this.pinMesh || !this.ringMesh) return;
     const zoomScale = clamp(altitude / 12.0, 0.025, 1.35);
 
     let pinCount = 0;
@@ -247,7 +311,7 @@ export class GlobeSeismicHeatmapLayer {
   }
 
   public getPickables(): THREE.Object3D[] {
-    if (!this.enabled || !this.group.visible) return [];
+    if (!this.enabled || !this.group.visible || !this.pinMesh || !this.ringMesh) return [];
     const out: THREE.Object3D[] = [];
     if (this.pinMesh.count > 0) out.push(this.pinMesh);
     if (this.ringMesh.count > 0) out.push(this.ringMesh);
@@ -291,8 +355,12 @@ export class GlobeSeismicHeatmapLayer {
       this.group.visible = false;
       return;
     }
+    this.ensureAllocated();
+    if (this.dirtyRaster && this.normalizedPoints.length > 0) {
+      this.rasterizeIntoTexture();
+    }
     this.group.visible = altitude > 0.10;
-    if (!this.group.visible) return;
+    if (!this.group.visible || !this.shellMat) return;
 
     const closeFade = clamp((altitude - 0.10) / 0.24, 0, 1);
     this.shellMat.uniforms.uTime.value = elapsedSec;
@@ -305,13 +373,8 @@ export class GlobeSeismicHeatmapLayer {
   }
 
   public dispose() {
-    this.heatTex.dispose();
-    this.shellGeo.dispose();
-    this.shellMat.dispose();
-    this.pinGeo.dispose();
-    this.pinMat.dispose();
-    this.ringGeo.dispose();
-    this.ringMat.dispose();
+    this.enabled = false;
+    this.releaseIdleMemory();
   }
 }
 

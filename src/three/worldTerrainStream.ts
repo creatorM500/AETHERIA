@@ -45,8 +45,8 @@ const UNIT_TILE_WIDTH = 48; // 1 z=14 tile = 48 scene units (~2.4 km)
 const Z14_COUNT = 16384; // 2^14
 const Z12_COUNT = 4096; // 2^12
 const MAX_CONCURRENT_CHUNK_FETCHES = 10;
-const MAX_PAYLOAD_CACHE = 12;
-const MAX_GPU_CHUNKS = 76; // 49 z=14 (7x7) + 25 z=12 (5x5) + small panning buffer
+const MAX_PAYLOAD_CACHE = 8;
+const MAX_GPU_CHUNKS = 60; // Tight ceiling (<500MB total budget) covering active core & outer hills
 
 interface ActiveTerrainChunk {
   key: string;
@@ -890,14 +890,44 @@ export class GlobalTerrainStreamManager {
     }
   }
 
-  public trimMemory() {
+  public getCacheStats() {
+    return {
+      activeChunks: this.activeChunks.size,
+      payloadCache: this.payloadCache.size,
+    };
+  }
+
+  public pruneTerrainCaches(keepMaxChunks: number) {
+    const safeKeep = Math.max(0, Math.floor(keepMaxChunks));
+    while (this.payloadCache.size > 2) {
+      const oldest = this.payloadCache.keys().next().value;
+      if (!oldest) break;
+      this.payloadCache.delete(oldest);
+    }
+    if (this.activeChunks.size <= safeKeep) return;
+
+    const candidates = Array.from(this.activeChunks.values())
+      .filter((c) => !this.desiredKeys.has(c.key) || !c.isCoreTile)
+      .sort((a, b) => a.lastUsedMs - b.lastUsedMs);
+
+    for (const victim of candidates) {
+      if (this.activeChunks.size <= safeKeep) break;
+      this.disposeChunk(victim);
+      this.activeChunks.delete(victim.key);
+      this.desiredKeys.delete(victim.key);
+    }
+    this.buildQueue = this.buildQueue.filter((key) => this.activeChunks.has(key));
+    this.refreshTier1Mask();
+  }
+
+  public trimMemory(aggressive = false) {
     this.payloadCache.clear();
-    trimTileCanvasCaches();
+    trimTileCanvasCaches(0);
     this.cancelAllFetches();
     this.lastCenterKey = '';
 
     for (const [key, chunk] of Array.from(this.activeChunks.entries())) {
-      if (!chunk.isCoreTile) {
+      if (aggressive || !chunk.isCoreTile) {
         this.disposeChunk(chunk);
         this.activeChunks.delete(key);
         this.desiredKeys.delete(key);

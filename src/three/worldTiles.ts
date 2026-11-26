@@ -7,6 +7,7 @@ import {
   tileYToLat,
 } from '../shared/geo.ts';
 import type { GlobeTextureMode } from '../shared/types.ts';
+import { computePruneEvictionCount } from '../shared/memoryBudget.ts';
 import { applyRegionalTileTerminatorShader, type GlobeSolarUniforms } from './shaders.ts';
 
 function getTileUrl(mode: GlobeTextureMode, z: number, x: number, y: number): string {
@@ -92,8 +93,16 @@ function applySpectralTintRect(
   }
 }
 
-const MAX_PLANETARY_CANVAS_CACHE = 2;
+const MAX_PLANETARY_CANVAS_CACHE = 1;
 const planetaryCanvasCache = new Map<GlobeTextureMode, HTMLCanvasElement>();
+
+export function prunePlanetaryCanvasCache(keepMode?: GlobeTextureMode) {
+  for (const [mode, canvas] of Array.from(planetaryCanvasCache.entries())) {
+    if (keepMode && mode === keepMode) continue;
+    disposeCachedCanvas(canvas);
+    planetaryCanvasCache.delete(mode);
+  }
+}
 
 function disposeCachedCanvas(canvas: HTMLCanvasElement | undefined) {
   if (!canvas) return;
@@ -272,7 +281,7 @@ export async function streamPlanetaryTilesIntoCanvas(
   }
 }
 
-const MAX_SECTOR_CANVAS_CACHE = 4;
+const MAX_SECTOR_CANVAS_CACHE = 2;
 const sectorCanvasCache = new Map<string, HTMLCanvasElement>();
 
 /**
@@ -401,18 +410,49 @@ export async function streamSectorTextureIntoCanvas(
   sectorCanvasCache.set(cacheKey, snapshot);
 }
 
-const MAX_SINGLE_CHUNK_CANVAS_CACHE = 12;
+const MAX_SINGLE_CHUNK_CANVAS_CACHE = 6;
 const singleChunkCanvasCache = new Map<string, HTMLCanvasElement>();
 
-export function trimTileCanvasCaches() {
-  for (const canvas of sectorCanvasCache.values()) {
+function evictOldestCanvases(cache: Map<string, HTMLCanvasElement>, count: number) {
+  if (count <= 0) return;
+  let removed = 0;
+  for (const [key, canvas] of Array.from(cache.entries())) {
+    if (removed >= count) break;
     disposeCachedCanvas(canvas);
+    cache.delete(key);
+    removed += 1;
   }
-  sectorCanvasCache.clear();
-  for (const canvas of singleChunkCanvasCache.values()) {
-    disposeCachedCanvas(canvas);
+}
+
+export function trimTileCanvasCaches(keepFraction = 0) {
+  if (keepFraction <= 0) {
+    for (const canvas of sectorCanvasCache.values()) {
+      disposeCachedCanvas(canvas);
+    }
+    sectorCanvasCache.clear();
+    for (const canvas of singleChunkCanvasCache.values()) {
+      disposeCachedCanvas(canvas);
+    }
+    singleChunkCanvasCache.clear();
+    return;
   }
-  singleChunkCanvasCache.clear();
+  const dropFrac = Math.max(0, Math.min(1, 1 - keepFraction));
+  evictOldestCanvases(
+    sectorCanvasCache,
+    computePruneEvictionCount(sectorCanvasCache.size, dropFrac, 0)
+  );
+  evictOldestCanvases(
+    singleChunkCanvasCache,
+    computePruneEvictionCount(singleChunkCanvasCache.size, dropFrac, 1)
+  );
+}
+
+export function getTileCanvasCacheStats() {
+  return {
+    planetaryCanvases: planetaryCanvasCache.size,
+    sectorCanvases: sectorCanvasCache.size,
+    chunkCanvases: singleChunkCanvasCache.size,
+  };
 }
 
 /**
@@ -998,7 +1038,7 @@ export class GlobeRegionalTileManager {
       tex.anisotropy = this.maxAnisotropy;
       tex.needsUpdate = true;
 
-      if (this.textureCache.size >= 96) {
+      if (this.textureCache.size >= 64) {
         const oldestKey = this.textureCache.keys().next().value;
         if (oldestKey) {
           disposeTextureAndCanvas(this.textureCache.get(oldestKey));
@@ -1060,6 +1100,26 @@ export class GlobeRegionalTileManager {
     mesh.renderOrder = spec.renderOrder;
     this.group.add(mesh);
     this.activeMeshes.set(spec.key, mesh);
+  }
+
+  public getCacheStats() {
+    return {
+      textureCacheCount: this.textureCache.size,
+      activeMeshesCount: this.activeMeshes.size,
+      rawParentCount: this.rawParentCache.size,
+    };
+  }
+
+  public pruneCache(keepCount: number) {
+    const safeKeep = Math.max(0, Math.floor(keepCount));
+    this.rawParentCache.clear();
+    if (this.textureCache.size <= safeKeep) return;
+    for (const [key, tex] of Array.from(this.textureCache.entries())) {
+      if (this.textureCache.size <= safeKeep) break;
+      if (this.activeMeshes.has(key) || this.desiredSpecs.has(key)) continue;
+      disposeTextureAndCanvas(tex);
+      this.textureCache.delete(key);
+    }
   }
 
   public dispose() {

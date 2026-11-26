@@ -33,7 +33,16 @@ import {
   GodsEyeTargetReticle,
   type GodsEyeShaderUniforms,
 } from '../three/godsEyeVisuals.ts';
-import { computeSubSolarPoint } from '../shared/solarPosition.ts';
+import {
+  computeDayNightTransitionState,
+  computeSubSolarPoint,
+} from '../shared/solarPosition.ts';
+import {
+  CLIENT_HARD_PRUNE_MB,
+  CLIENT_SOFT_PRUNE_MB,
+  estimateClientFootprintMb,
+  evaluateMemoryBudget,
+} from '../shared/memoryBudget.ts';
 import {
   buildPlanetaryDemTextures,
   createCloudTexture,
@@ -57,7 +66,10 @@ import {
 } from '../three/shaders.ts';
 import {
   GlobeRegionalTileManager,
+  getTileCanvasCacheStats,
+  prunePlanetaryCanvasCache,
   streamPlanetaryTilesIntoCanvas,
+  trimTileCanvasCaches,
 } from '../three/worldTiles.ts';
 
 export type GlobePickMode = 'none' | 'origin' | 'destination' | 'terrain';
@@ -99,6 +111,7 @@ interface GlobeWebGLCanvasProps {
   windCycloneEvents?: GlobalEvent[];
   weatherRadarEnabled?: boolean;
   weatherRadarField?: GlobalWeatherRadarResponse | null;
+  dayNightEnabled?: boolean;
   trafficCameraPoint?: {
     lat: number;
     lng: number;
@@ -151,16 +164,17 @@ export function GlobeWebGLCanvas({
   flyAlongActive,
   onFlyAlongProgress,
   onFlyAlongComplete,
-  seismicHeatmapEnabled = true,
+  seismicHeatmapEnabled = false,
   seismicQuakes24h = [],
   seismicMetrics = null,
   onSelectQuake24h,
   onLiveTerrainCoordsChange,
-  windLayerEnabled = true,
+  windLayerEnabled = false,
   windField = null,
   windCycloneEvents,
-  weatherRadarEnabled = true,
+  weatherRadarEnabled = false,
   weatherRadarField = null,
+  dayNightEnabled = true,
   trafficCameraPoint = null,
   onSelectTrafficCamera,
 }: GlobeWebGLCanvasProps) {
@@ -214,6 +228,7 @@ export function GlobeWebGLCanvas({
     windCycloneEvents,
     weatherRadarEnabled,
     weatherRadarField,
+    dayNightEnabled,
   });
   propsRef.current = {
     events,
@@ -235,6 +250,7 @@ export function GlobeWebGLCanvas({
     windCycloneEvents,
     weatherRadarEnabled,
     weatherRadarField,
+    dayNightEnabled,
   };
 
   const sceneHandleRef = useRef<{
@@ -266,6 +282,7 @@ export function GlobeWebGLCanvas({
     isSoftwareGl: boolean;
     maxAnisotropy: number;
     setTextureMode: (mode: GlobeTextureMode) => void;
+    setDayNightEnabled: (enabled: boolean) => void;
     setVerticalExaggeration: (exag: number) => void;
     setQualityPreference: (pref: 'auto' | QualityTier) => void;
     rebuildEvents: (evs: GlobalEvent[], selectedId: string | null) => void;
@@ -381,7 +398,11 @@ export function GlobeWebGLCanvas({
     rimLight.position.set(-22, -10, -18);
     scene.add(rimLight);
 
-    const syncModeLighting = (texMode: GlobeTextureMode, vpMode: ViewportMode) => {
+    const syncModeLighting = (
+      texMode: GlobeTextureMode,
+      vpMode: ViewportMode,
+      terminatorMix = 1.0
+    ) => {
       const isGodsEye = texMode === 'godseye';
       const isSatellite = texMode === 'satellite';
       if (vpMode === 'sector3d') {
@@ -390,10 +411,11 @@ export function GlobeWebGLCanvas({
         hemiLight.intensity = 1.05;
         rimLight.intensity = 0.85;
       } else if (isSatellite) {
-        scene.environmentIntensity = 0.28;
-        keyLight.intensity = 2.65;
-        hemiLight.intensity = 0.42;
-        rimLight.intensity = 0.30;
+        const m = clamp(terminatorMix, 0, 1);
+        scene.environmentIntensity = 0.78 + (0.28 - 0.78) * m;
+        keyLight.intensity = 1.35 + (2.65 - 1.35) * m;
+        hemiLight.intensity = 1.15 + (0.42 - 1.15) * m;
+        rimLight.intensity = 0.65 + (0.30 - 0.65) * m;
       } else if (isGodsEye) {
         scene.environmentIntensity = 0.24;
         keyLight.intensity = 1.05;
@@ -406,7 +428,13 @@ export function GlobeWebGLCanvas({
         rimLight.intensity = 0.52;
       }
     };
-    syncModeLighting(propsRef.current.textureMode, propsRef.current.viewportMode);
+    const initialTerminatorOn =
+      propsRef.current.textureMode === 'satellite' && propsRef.current.dayNightEnabled;
+    syncModeLighting(
+      propsRef.current.textureMode,
+      propsRef.current.viewportMode,
+      initialTerminatorOn ? 1.0 : 0.0
+    );
 
     // Spectral Starfield (cool O/B blue-white, crisp white, warm K/M amber)
     const starCount = 1400;
@@ -507,11 +535,21 @@ export function GlobeWebGLCanvas({
     ).normalize();
     keyLight.position.copy(sunDir).multiplyScalar(64);
 
+    let dayNightProgress =
+      bootTexMode === 'satellite' && propsRef.current.dayNightEnabled ? 1.0 : 0.0;
+    let dayNightSettled = true;
+    const initialDayNightState = computeDayNightTransitionState(
+      dayNightProgress,
+      bootTexMode === 'satellite' && propsRef.current.dayNightEnabled,
+      0
+    );
+
     const solarUniforms: GlobeSolarUniforms = {
       uSunDir: { value: sunDir.clone() },
-      uTerminatorEnabled: { value: bootTexMode === 'satellite' ? 1.0 : 0.0 },
+      uTerminatorEnabled: { value: initialDayNightState.terminatorMix },
+      uNightLightsMix: { value: initialDayNightState.nightLightsMix },
       uNightLightsMap: { value: nightLightsTex },
-      uNightLightsIntensity: { value: 1.35 },
+      uNightLightsIntensity: { value: 1.38 },
       uPlanetRoughnessMap: { value: initialTex.roughnessMap },
     };
 
@@ -556,21 +594,28 @@ export function GlobeWebGLCanvas({
 
     const globeSeismicLayer = new GlobeSeismicHeatmapLayer(GLOBE_RADIUS, isSoftwareGl);
     globeSeismicLayer.setEnabled(propsRef.current.seismicHeatmapEnabled);
+    if (propsRef.current.seismicHeatmapEnabled && propsRef.current.seismicMetrics) {
+      globeSeismicLayer.setData(propsRef.current.seismicQuakes24h, propsRef.current.seismicMetrics);
+    }
 
     const globeWindLayer = new GlobeWindParticleLayer(GLOBE_RADIUS);
     globeWindLayer.setEnabled(propsRef.current.windLayerEnabled);
-    if (propsRef.current.windField) {
-      globeWindLayer.setData(propsRef.current.windField);
+    if (propsRef.current.windLayerEnabled) {
+      if (propsRef.current.windField) {
+        globeWindLayer.setData(propsRef.current.windField);
+      }
+      globeWindLayer.setCyclones(propsRef.current.windCycloneEvents ?? propsRef.current.events);
     }
-    globeWindLayer.setCyclones(propsRef.current.windCycloneEvents ?? propsRef.current.events);
 
     const globeWeatherRadarLayer = new GlobeWeatherRadarLayer(GLOBE_RADIUS, isSoftwareGl);
     globeWeatherRadarLayer.setEnabled(propsRef.current.weatherRadarEnabled);
-    globeWeatherRadarLayer.setData(
-      propsRef.current.weatherRadarField,
-      propsRef.current.windField,
-      propsRef.current.windCycloneEvents ?? propsRef.current.events
-    );
+    if (propsRef.current.weatherRadarEnabled) {
+      globeWeatherRadarLayer.setData(
+        propsRef.current.weatherRadarField,
+        propsRef.current.windField,
+        propsRef.current.windCycloneEvents ?? propsRef.current.events
+      );
+    }
 
     const cloudTex = createCloudTexture(!isSoftwareGl);
     const cloudGeo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.016, 48, 36);
@@ -587,16 +632,19 @@ export function GlobeWebGLCanvas({
     cloudMesh.renderOrder = 8;
     globeRoot.add(cloudMesh);
 
+    const initialAtmoTerm =
+      bootTexMode === 'satellite' ? initialDayNightState.terminatorMix : 0.0;
+
     const atmoGeo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.045, 48, 36);
     const atmoMat = createAtmosphereMaterial(sunDir);
-    atmoMat.uniforms.terminatorStrength.value = bootTexMode === 'satellite' ? 1.0 : 0.25;
+    atmoMat.uniforms.terminatorStrength.value = initialAtmoTerm;
     const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
     atmoMesh.renderOrder = 10;
     globeRoot.add(atmoMesh);
 
     const haloGeo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.095, 48, 36);
     const haloMat = createOuterHaloMaterial(sunDir);
-    haloMat.uniforms.terminatorStrength.value = bootTexMode === 'satellite' ? 1.0 : 0.25;
+    haloMat.uniforms.terminatorStrength.value = initialAtmoTerm;
     const haloMesh = new THREE.Mesh(haloGeo, haloMat);
     haloMesh.renderOrder = 11;
     globeRoot.add(haloMesh);
@@ -871,14 +919,23 @@ export function GlobeWebGLCanvas({
       terrainStream?.setTextureMode(mode);
 
       const isSatellite = mode === 'satellite';
-      syncModeLighting(mode, propsRef.current.viewportMode);
-      solarUniforms.uTerminatorEnabled.value = isSatellite ? 1.0 : 0.0;
+      prunePlanetaryCanvasCache(mode);
+      if (isSatellite) {
+        dayNightSettled = false;
+      } else {
+        dayNightProgress = 0.0;
+        dayNightSettled = true;
+        solarUniforms.uTerminatorEnabled.value = 0.0;
+        solarUniforms.uNightLightsMix.value = 0.0;
+      }
+      syncModeLighting(mode, propsRef.current.viewportMode, solarUniforms.uTerminatorEnabled.value);
 
       const glowHex = mode === 'thermal' ? '#f59e0b' : mode === 'topo' ? '#38bdf8' : '#22d3ee';
       atmoMat.uniforms.glowColor.value.set(glowHex);
       haloMat.uniforms.glowColor.value.set(glowHex);
-      atmoMat.uniforms.terminatorStrength.value = isSatellite ? 1.0 : 0.25;
-      haloMat.uniforms.terminatorStrength.value = isSatellite ? 1.0 : 0.25;
+      const effectiveAtmo = isSatellite ? solarUniforms.uTerminatorEnabled.value : 0.0;
+      atmoMat.uniforms.terminatorStrength.value = effectiveAtmo;
+      haloMat.uniforms.terminatorStrength.value = effectiveAtmo;
       cloudModeEnabled = isSatellite;
       cloudMesh.visible = cloudModeEnabled;
 
@@ -897,6 +954,63 @@ export function GlobeWebGLCanvas({
         );
       }
       requestRenderIfNeeded();
+    };
+
+    const runClientMemoryPruner = (forceAggressive = false) => {
+      if (disposed) return;
+      const perfMem = (
+        performance as Performance & { memory?: { usedJSHeapSize?: number } }
+      ).memory;
+      const jsHeapMb =
+        typeof perfMem?.usedJSHeapSize === 'number'
+          ? perfMem.usedJSHeapSize / (1024 * 1024)
+          : null;
+      const canvasStats = getTileCanvasCacheStats();
+      const regionalStats = regionalTiles.getCacheStats();
+      const terrainStats = terrainStream?.getCacheStats();
+
+      const estMb = estimateClientFootprintMb({
+        jsHeapMb,
+        terrainChunks: terrainStats?.activeChunks ?? 0,
+        regionalTextures: regionalStats.textureCacheCount,
+        cachedCanvases:
+          canvasStats.planetaryCanvases + canvasStats.sectorCanvases + canvasStats.chunkCanvases,
+        windActive: globeWindLayer.isAllocated(),
+        radarActive: globeWeatherRadarLayer.isAllocated(),
+        seismicActive: globeSeismicLayer.isAllocated(),
+        hasPlanetDem: Boolean(realPlanetDemTextures),
+        baseTexturePx: isSoftwareGl ? 1024 : 2048,
+      });
+
+      const budget = evaluateMemoryBudget(
+        estMb,
+        CLIENT_SOFT_PRUNE_MB,
+        CLIENT_HARD_PRUNE_MB
+      );
+      if (!forceAggressive && budget.pressure === 'normal') return;
+
+      prunePlanetaryCanvasCache(activeTexMode);
+      if (!propsRef.current.windLayerEnabled) globeWindLayer.releaseIdleMemory();
+      if (!propsRef.current.weatherRadarEnabled) globeWeatherRadarLayer.releaseIdleMemory();
+      if (!propsRef.current.seismicHeatmapEnabled) globeSeismicLayer.releaseIdleMemory();
+
+      if (forceAggressive || budget.pressure === 'critical') {
+        trimTileCanvasCaches(0);
+        regionalTiles.pruneCache(propsRef.current.viewportMode === 'globe' ? 18 : 6);
+        if (propsRef.current.viewportMode !== 'sector3d') {
+          terrainStream?.trimMemory(true);
+        } else {
+          terrainStream?.pruneTerrainCaches(36);
+        }
+      } else {
+        trimTileCanvasCaches(1 - budget.pruneFraction);
+        regionalTiles.pruneCache(propsRef.current.viewportMode === 'globe' ? 36 : 12);
+        if (propsRef.current.viewportMode !== 'sector3d') {
+          terrainStream?.trimMemory(false);
+        } else {
+          terrainStream?.pruneTerrainCaches(48);
+        }
+      }
     };
 
     let lastEventsSignature = '';
@@ -1121,7 +1235,7 @@ export function GlobeWebGLCanvas({
       globeRoot.visible = !isSector;
       stars.visible = !isSector;
       sectorContainer.visible = isSector;
-      syncModeLighting(activeTexMode, mode);
+      syncModeLighting(activeTexMode, mode, solarUniforms.uTerminatorEnabled.value);
 
       if (isSector) {
         const pal = getTerrainAtmospherePalette(activeTexMode);
@@ -1148,7 +1262,8 @@ export function GlobeWebGLCanvas({
           triggerScanSweep(wx, wy, wz, 260);
         }
       } else {
-        terrainStream?.trimMemory();
+        terrainStream?.trimMemory(false);
+        runClientMemoryPruner(false);
         godsEyeUniforms.horizonFadeRadius.value = 0.0;
         godsEyeUniforms.edgeColor?.value.set('#06090f');
         preserveSectorCameraOffset = false;
@@ -1203,6 +1318,12 @@ export function GlobeWebGLCanvas({
       isSoftwareGl,
       maxAnisotropy,
       setTextureMode,
+      setDayNightEnabled: (enabled) => {
+        propsRef.current.dayNightEnabled = enabled;
+        const target = activeTexMode === 'satellite' && enabled ? 1 : 0;
+        dayNightSettled = Math.abs(dayNightProgress - target) < 0.0005;
+        requestRenderIfNeeded();
+      },
       setVerticalExaggeration: (exag) => {
         terrainStream?.setVerticalExaggeration(exag);
         syncTerrainSeismicMarkers();
@@ -1221,7 +1342,7 @@ export function GlobeWebGLCanvas({
       syncViewportMode,
       syncSeismicHeatmap: (enabled, quakes, metrics) => {
         globeSeismicLayer.setEnabled(enabled);
-        if (metrics) {
+        if (enabled && metrics) {
           globeSeismicLayer.setData(quakes, metrics);
           if (terrainStream) {
             terrainSeismicLayer.syncLocalQuakes(
@@ -1234,20 +1355,29 @@ export function GlobeWebGLCanvas({
           }
         } else {
           terrainSeismicLayer.group.visible = false;
+          if (!enabled) runClientMemoryPruner(false);
         }
         requestRenderIfNeeded();
       },
       syncWindLayer: (enabled, field, evs) => {
         globeWindLayer.setEnabled(enabled);
-        if (field) {
-          globeWindLayer.setData(field);
+        if (enabled) {
+          if (field) {
+            globeWindLayer.setData(field);
+          }
+          globeWindLayer.setCyclones(evs);
+        } else {
+          runClientMemoryPruner(false);
         }
-        globeWindLayer.setCyclones(evs);
         requestRenderIfNeeded();
       },
       syncWeatherRadarLayer: (enabled, rField, wField, evs) => {
         globeWeatherRadarLayer.setEnabled(enabled);
-        globeWeatherRadarLayer.setData(rField, wField, evs);
+        if (enabled) {
+          globeWeatherRadarLayer.setData(rField, wField, evs);
+        } else {
+          runClientMemoryPruner(false);
+        }
         requestRenderIfNeeded();
       },
       resetFlyAlong: () => {
@@ -1664,6 +1794,11 @@ export function GlobeWebGLCanvas({
     let smoothedFrameMs = 16.6;
     let lastQualityEvalMs = startTime;
     let lastSolarSyncMs = startTime;
+    const memoryPruneTimerId = window.setInterval(() => {
+      if (!disposed && !loopPaused && !isContextLost) {
+        runClientMemoryPruner(false);
+      }
+    }, 8000);
 
     function tick() {
       if (disposed || loopPaused || isContextLost) return;
@@ -1684,6 +1819,26 @@ export function GlobeWebGLCanvas({
         solarUniforms.uSunDir.value.set(solar.sunDir.x, solar.sunDir.y, solar.sunDir.z);
         atmoMat.uniforms.sunDir.value.copy(solarUniforms.uSunDir.value);
         haloMat.uniforms.sunDir.value.copy(solarUniforms.uSunDir.value);
+      }
+
+      const dayNightTarget = activeTexMode === 'satellite' && propsRef.current.dayNightEnabled;
+      const dayNightTargetNum = dayNightTarget ? 1 : 0;
+      if (!dayNightSettled || Math.abs(dayNightProgress - dayNightTargetNum) > 0.0005) {
+        const transition = computeDayNightTransitionState(
+          dayNightProgress,
+          dayNightTarget,
+          isSoftwareGl ? Math.max(delta, 0.085) : delta,
+          isSoftwareGl ? 0.55 : 0.95
+        );
+        dayNightProgress = transition.nextProgress;
+        dayNightSettled = transition.settled;
+        solarUniforms.uTerminatorEnabled.value = transition.terminatorMix;
+        solarUniforms.uNightLightsMix.value = transition.nightLightsMix;
+        const effectiveAtmoTerm =
+          activeTexMode === 'satellite' ? transition.terminatorMix : 0.0;
+        atmoMat.uniforms.terminatorStrength.value = effectiveAtmoTerm;
+        haloMat.uniforms.terminatorStrength.value = effectiveAtmoTerm;
+        syncModeLighting(activeTexMode, propsRef.current.viewportMode, transition.terminatorMix);
       }
 
       if (!isSoftwareGl && rawFrameMs > 2 && rawFrameMs < 160 && propsRef.current.qualityPreference === 'auto') {
@@ -1909,6 +2064,7 @@ export function GlobeWebGLCanvas({
 
       if (isSoftwareGl) {
         const keepStepping =
+          !dayNightSettled ||
           flyState.active ||
           scanAnimActive ||
           propsRef.current.flyAlongActive ||
@@ -1930,6 +2086,7 @@ export function GlobeWebGLCanvas({
     return () => {
       disposed = true;
       tileStreamEpoch += 1;
+      clearInterval(memoryPruneTimerId);
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       clearTimeout(swTimerId);
@@ -2000,6 +2157,10 @@ export function GlobeWebGLCanvas({
   useEffect(() => {
     sceneHandleRef.current?.setTextureMode(textureMode);
   }, [textureMode]);
+
+  useEffect(() => {
+    sceneHandleRef.current?.setDayNightEnabled(dayNightEnabled);
+  }, [dayNightEnabled]);
 
   useEffect(() => {
     sceneHandleRef.current?.setVerticalExaggeration(terrainExaggeration);

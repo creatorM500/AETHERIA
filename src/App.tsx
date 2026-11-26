@@ -19,6 +19,7 @@ import {
   Play,
   RefreshCw,
   RotateCw,
+  SunMoon,
   Wind,
   X,
   ZoomIn,
@@ -121,7 +122,8 @@ export default function App() {
   const [feedError, setFeedError] = useState<string | null>(null);
 
   const [categoryFilter, setCategoryFilter] = useState<EventCategory | 'all'>('all');
-  const [textureMode, setTextureMode] = useState<GlobeTextureMode>('godseye');
+  const [textureMode, setTextureMode] = useState<GlobeTextureMode>('satellite');
+  const [dayNightEnabled, setDayNightEnabled] = useState<boolean>(true);
   const [viewportMode, setViewportMode] = useState<ViewportMode>('globe');
   const [activeSector, setActiveSector] = useState<SectorPreset>(SECTOR_PRESETS[0]);
   const [selectedEvent, setSelectedEvent] = useState<GlobalEvent | null>(null);
@@ -135,7 +137,7 @@ export default function App() {
   const [dockExpanded, setDockExpanded] = useState<boolean>(true);
   const [autoRotate, setAutoRotate] = useState<boolean>(false);
 
-  const [seismicHeatmapEnabled, setSeismicHeatmapEnabled] = useState<boolean>(true);
+  const [seismicHeatmapEnabled, setSeismicHeatmapEnabled] = useState<boolean>(false);
   const [seismicQuakes24h, setSeismicQuakes24h] = useState<SeismicQuake24h[]>([]);
   const [seismicMetrics, setSeismicMetrics] = useState<SeismicHeatScaleMetrics | null>(null);
   const [selectedQuake24h, setSelectedQuake24h] = useState<SeismicQuake24h | null>(null);
@@ -145,9 +147,9 @@ export default function App() {
   const fetchSeqRef = useRef<number>(0);
   const fetchAbortRef = useRef<AbortController | null>(null);
 
-  const [windLayerEnabled, setWindLayerEnabled] = useState<boolean>(true);
+  const [windLayerEnabled, setWindLayerEnabled] = useState<boolean>(false);
   const [windField, setWindField] = useState<GlobalWindFieldResponse | null>(null);
-  const [weatherRadarEnabled, setWeatherRadarEnabled] = useState<boolean>(true);
+  const [weatherRadarEnabled, setWeatherRadarEnabled] = useState<boolean>(false);
   const [weatherRadarField, setWeatherRadarField] = useState<GlobalWeatherRadarResponse | null>(
     null
   );
@@ -240,19 +242,77 @@ export default function App() {
       });
   }, [mapsApiKey]);
 
+  const seismicNeeded =
+    seismicHeatmapEnabled ||
+    activeDrawer === 'briefing' ||
+    (activeDrawer === 'telemetry' && telemetryTab === 'alerts');
+  const windNeeded = windLayerEnabled || activeDrawer === 'briefing';
+  const radarNeeded = weatherRadarEnabled || activeDrawer === 'briefing';
+
+  const layerNeedRef = useRef({ seismicNeeded, windNeeded, radarNeeded });
+  layerNeedRef.current = { seismicNeeded, windNeeded, radarNeeded };
+
+  const fetchSeismic24h = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const res = await fetch('/api/earthquakes/24h', { signal });
+      if (!res.ok || signal?.aborted) return;
+      const payload = (await res.json()) as SeismicHeatmap24hResponse;
+      if (signal?.aborted) return;
+      setSeismicQuakes24h(payload.quakes ?? []);
+      setSeismicMetrics(payload.metrics ?? null);
+    } catch {
+      // Non-blocking secondary telemetry
+    }
+  }, []);
+
+  const fetchWindField = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const res = await fetch('/api/wind/global', { signal });
+      if (!res.ok || signal?.aborted) return;
+      const payload = (await res.json()) as GlobalWindFieldResponse;
+      if (signal?.aborted) return;
+      if (Array.isArray(payload.uGrid) && Array.isArray(payload.vGrid)) {
+        setWindField(payload);
+      }
+    } catch {
+      // Non-blocking secondary telemetry
+    }
+  }, []);
+
+  const fetchWeatherRadar = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const res = await fetch('/api/weather/radar', { signal });
+      if (!res.ok || signal?.aborted) return;
+      const payload = (await res.json()) as GlobalWeatherRadarResponse;
+      if (signal?.aborted) return;
+      if (Array.isArray(payload.precipGrid) && Array.isArray(payload.pressureGrid)) {
+        setWeatherRadarField(payload);
+      }
+    } catch {
+      // Non-blocking secondary telemetry
+    }
+  }, []);
+
   const fetchWorldEvents = useCallback(async () => {
     fetchAbortRef.current?.abort();
     const controller = new AbortController();
     fetchAbortRef.current = controller;
     const seq = ++fetchSeqRef.current;
+    const needs = layerNeedRef.current;
 
     try {
       setFeedError(null);
       const [eventsRes, seismicRes, windRes, radarRes] = await Promise.all([
         fetch('/api/world/events?category=all', { signal: controller.signal }),
-        fetch('/api/earthquakes/24h', { signal: controller.signal }).catch(() => null),
-        fetch('/api/wind/global', { signal: controller.signal }).catch(() => null),
-        fetch('/api/weather/radar', { signal: controller.signal }).catch(() => null),
+        needs.seismicNeeded
+          ? fetch('/api/earthquakes/24h', { signal: controller.signal }).catch(() => null)
+          : Promise.resolve(null),
+        needs.windNeeded
+          ? fetch('/api/wind/global', { signal: controller.signal }).catch(() => null)
+          : Promise.resolve(null),
+        needs.radarNeeded
+          ? fetch('/api/weather/radar', { signal: controller.signal }).catch(() => null)
+          : Promise.resolve(null),
       ]);
       if (seq !== fetchSeqRef.current || controller.signal.aborted) return;
       if (!eventsRes.ok) throw new Error('Error al sincronizar telemetría global');
@@ -308,6 +368,28 @@ export default function App() {
       }
     }
   }, []);
+
+  // Lazy-fetch secondary datasets only when explicitly enabled or opened by the user
+  useEffect(() => {
+    if (!seismicNeeded || seismicMetrics) return;
+    const controller = new AbortController();
+    void fetchSeismic24h(controller.signal);
+    return () => controller.abort();
+  }, [seismicNeeded, seismicMetrics, fetchSeismic24h]);
+
+  useEffect(() => {
+    if (!windNeeded || windField) return;
+    const controller = new AbortController();
+    void fetchWindField(controller.signal);
+    return () => controller.abort();
+  }, [windNeeded, windField, fetchWindField]);
+
+  useEffect(() => {
+    if (!radarNeeded || weatherRadarField) return;
+    const controller = new AbortController();
+    void fetchWeatherRadar(controller.signal);
+    return () => controller.abort();
+  }, [radarNeeded, weatherRadarField, fetchWeatherRadar]);
 
   useEffect(() => {
     let lastFetchMs = 0;
@@ -842,10 +924,13 @@ export default function App() {
     <div
       className="relative w-screen h-screen overflow-hidden bg-[#06090f] text-slate-100 select-none"
       data-viewport-mode={viewportMode}
+      data-texture-mode={textureMode}
+      data-day-night={dayNightEnabled && textureMode === 'satellite' ? 'on' : 'off'}
       data-category-filter={categoryFilter}
       data-event-count={visibleEvents.length}
       data-wind-layer={windLayerEnabled ? 'on' : 'off'}
       data-weather-radar={weatherRadarEnabled ? 'on' : 'off'}
+      data-seismic-layer={seismicHeatmapEnabled ? 'on' : 'off'}
       data-traffic-camera={trafficCamera ? trafficCamera.cameraCode : 'none'}
       data-unread-alerts={unreadAlertCount}
     >
@@ -1009,6 +1094,7 @@ export default function App() {
             windCycloneEvents={events}
             weatherRadarEnabled={weatherRadarEnabled}
             weatherRadarField={weatherRadarField}
+            dayNightEnabled={dayNightEnabled}
             trafficCameraPoint={
               trafficCamera
                 ? {
@@ -1270,14 +1356,16 @@ export default function App() {
                   <span
                     data-testid="solar-phase-readout"
                     className={`font-mono-tabular ${
-                      solarStatus.phase === 'day'
-                        ? 'text-amber-300'
-                        : solarStatus.phase === 'twilight'
-                          ? 'text-orange-300'
-                          : 'text-indigo-300'
+                      !dayNightEnabled
+                        ? 'text-amber-200'
+                        : solarStatus.phase === 'day'
+                          ? 'text-amber-300'
+                          : solarStatus.phase === 'twilight'
+                            ? 'text-orange-300'
+                            : 'text-indigo-300'
                     }`}
                   >
-                    {solarStatus.utcLabel} · {solarStatus.phaseLabel}
+                    {solarStatus.utcLabel} · {dayNightEnabled ? solarStatus.phaseLabel : 'Solo día'}
                   </span>
                 </>
               )}
@@ -1805,6 +1893,35 @@ export default function App() {
                 <RotateCw className="w-3.5 h-3.5" />
               </button>
             )}
+
+            <button
+              type="button"
+              data-testid="day-night-toggle"
+              onClick={() => {
+                if (viewportMode !== 'globe' || textureMode !== 'satellite') {
+                  setViewportMode('globe');
+                  setTextureMode('satellite');
+                  setDayNightEnabled(true);
+                } else {
+                  setDayNightEnabled((v) => !v);
+                }
+              }}
+              aria-pressed={dayNightEnabled && textureMode === 'satellite' && viewportMode === 'globe'}
+              aria-label="Alternar visualización día y noche en tiempo real"
+              title={
+                dayNightEnabled && textureMode === 'satellite'
+                  ? 'Desactivar terminador día/noche (vista diurna completa)'
+                  : 'Activar terminador solar día/noche y luces nocturnas'
+              }
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                dayNightEnabled && textureMode === 'satellite' && viewportMode === 'globe'
+                  ? 'bg-amber-500/15 text-amber-300'
+                  : 'text-slate-300 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <SunMoon className="w-3 h-3 shrink-0" />
+              <span>Día/Noche</span>
+            </button>
 
             <button
               type="button"

@@ -68,17 +68,18 @@ export class GlobeWeatherRadarLayer {
   public readonly group = new THREE.Group();
 
   private readonly globeRadius: number;
+  private readonly isSoftwareGl: boolean;
   private readonly texW: number;
   private readonly texH: number;
-  private readonly radarData: Uint8Array;
-  private readonly radarTex: THREE.DataTexture;
-  private readonly precipGeo: THREE.SphereGeometry;
-  private readonly precipMat: THREE.ShaderMaterial;
-  private readonly precipMesh: THREE.Mesh;
+  private radarData: Uint8Array | null = null;
+  private radarTex: THREE.DataTexture | null = null;
+  private precipGeo: THREE.SphereGeometry | null = null;
+  private precipMat: THREE.ShaderMaterial | null = null;
+  private precipMesh: THREE.Mesh | null = null;
 
-  private readonly isobarGeo: THREE.BufferGeometry;
-  private readonly isobarMat: THREE.LineBasicMaterial;
-  private readonly isobarLines: THREE.LineSegments;
+  private isobarGeo: THREE.BufferGeometry | null = null;
+  private isobarMat: THREE.LineBasicMaterial | null = null;
+  private isobarLines: THREE.LineSegments | null = null;
 
   private readonly coneGroup = new THREE.Group();
   private readonly coneGeos: THREE.BufferGeometry[] = [];
@@ -87,13 +88,25 @@ export class GlobeWeatherRadarLayer {
   private radarField: GlobalWeatherRadarResponse | null = null;
   private windField: GlobalWindFieldResponse | null = null;
   private cyclones: CycloneVortexSpec[] = [];
-  private enabled = true;
+  private enabled = false;
+  private allocated = false;
   private lastDataSignature = '';
 
   constructor(globeRadius: number, isSoftwareGl: boolean) {
     this.globeRadius = globeRadius;
+    this.isSoftwareGl = isSoftwareGl;
     this.texW = isSoftwareGl ? 540 : 720;
     this.texH = isSoftwareGl ? 270 : 360;
+    this.coneGroup.renderOrder = 5;
+    this.group.visible = false;
+  }
+
+  public isAllocated(): boolean {
+    return this.allocated;
+  }
+
+  private ensureAllocated() {
+    if (this.allocated) return;
 
     this.radarData = new Uint8Array(this.texW * this.texH * 4);
     this.radarTex = new THREE.DataTexture(
@@ -112,9 +125,9 @@ export class GlobeWeatherRadarLayer {
     this.radarTex.needsUpdate = true;
 
     this.precipGeo = new THREE.SphereGeometry(
-      globeRadius * 1.0044,
-      isSoftwareGl ? 96 : 128,
-      isSoftwareGl ? 72 : 96
+      this.globeRadius * 1.0044,
+      this.isSoftwareGl ? 96 : 128,
+      this.isSoftwareGl ? 72 : 96
     );
     this.precipMat = new THREE.ShaderMaterial({
       uniforms: {
@@ -290,15 +303,67 @@ export class GlobeWeatherRadarLayer {
     this.isobarLines = new THREE.LineSegments(this.isobarGeo, this.isobarMat);
     this.isobarLines.renderOrder = 4;
 
-    this.coneGroup.renderOrder = 5;
-
     this.group.add(this.precipMesh, this.isobarLines, this.coneGroup);
+    this.allocated = true;
+  }
+
+  public releaseIdleMemory() {
+    if (this.enabled || !this.allocated) return;
+    this.clearCones();
+    if (this.precipMesh) this.group.remove(this.precipMesh);
+    if (this.isobarLines) this.group.remove(this.isobarLines);
+    this.group.remove(this.coneGroup);
+    this.precipGeo?.dispose();
+    this.precipMat?.dispose();
+    this.radarTex?.dispose();
+    this.isobarGeo?.dispose();
+    this.isobarMat?.dispose();
+    this.precipMesh = null;
+    this.precipGeo = null;
+    this.precipMat = null;
+    this.radarTex = null;
+    this.radarData = null;
+    this.isobarLines = null;
+    this.isobarGeo = null;
+    this.isobarMat = null;
+    this.lastDataSignature = '';
+    this.allocated = false;
     this.group.visible = false;
+  }
+
+  private computeDataSignature(): string {
+    if (!this.radarField) return '';
+    const cycSig = this.cyclones
+      .map((c) => `${c.id}:${c.lat.toFixed(2)},${c.lng.toFixed(2)},${c.centralPressureHpa}`)
+      .join('|');
+    const windSig = this.windField?.updatedAt ?? 'none';
+    return `${this.radarField.updatedAt}|${windSig}|${cycSig}`;
+  }
+
+  private syncBuffersIfNeeded() {
+    if (!this.enabled || !this.radarField) {
+      this.group.visible = false;
+      return;
+    }
+    this.ensureAllocated();
+    const nextSig = this.computeDataSignature();
+    if (nextSig !== this.lastDataSignature) {
+      this.lastDataSignature = nextSig;
+      this.rebuildPrecipitationTexture();
+      this.rebuildIsobars();
+      this.rebuildCycloneForecastCones();
+    }
+    this.group.visible = true;
   }
 
   public setEnabled(enabled: boolean) {
     this.enabled = enabled;
-    this.group.visible = enabled && this.radarField !== null;
+    if (enabled) {
+      this.syncBuffersIfNeeded();
+    } else {
+      this.group.visible = false;
+      this.releaseIdleMemory();
+    }
   }
 
   public setData(
@@ -315,26 +380,17 @@ export class GlobeWeatherRadarLayer {
       return;
     }
 
-    const cycSig = this.cyclones
-      .map((c) => `${c.id}:${c.lat.toFixed(2)},${c.lng.toFixed(2)},${c.centralPressureHpa}`)
-      .join('|');
-    const windSig = windField?.updatedAt ?? 'none';
-    const nextSig = `${this.radarField.updatedAt}|${windSig}|${cycSig}`;
-
-    if (nextSig === this.lastDataSignature) {
-      this.group.visible = this.enabled;
+    if (!this.enabled) {
+      this.lastDataSignature = '';
+      this.group.visible = false;
       return;
     }
-    this.lastDataSignature = nextSig;
 
-    this.rebuildPrecipitationTexture();
-    this.rebuildIsobars();
-    this.rebuildCycloneForecastCones();
-    this.group.visible = this.enabled;
+    this.syncBuffersIfNeeded();
   }
 
   private rebuildPrecipitationTexture() {
-    if (!this.radarField) return;
+    if (!this.radarField || !this.radarData || !this.radarTex) return;
     const w = this.texW;
     const h = this.texH;
     const data = this.radarData;
@@ -365,7 +421,7 @@ export class GlobeWeatherRadarLayer {
   }
 
   private rebuildIsobars() {
-    if (!this.radarField) return;
+    if (!this.radarField || !this.isobarGeo) return;
     const segments = extractIsobarSegments(
       this.radarField,
       this.cyclones,
@@ -633,8 +689,9 @@ export class GlobeWeatherRadarLayer {
       this.group.visible = false;
       return;
     }
+    this.syncBuffersIfNeeded();
     this.group.visible = altitude > 0.08;
-    if (!this.group.visible) return;
+    if (!this.group.visible || !this.precipMat || !this.isobarMat) return;
 
     // Gently fade global precip & isobars below ~1.2 units so high-zoom street map tiles stay sharp
     const fade = THREE.MathUtils.clamp((altitude - 0.10) / 0.85, 0.18, 1.0);
@@ -644,11 +701,7 @@ export class GlobeWeatherRadarLayer {
   }
 
   public dispose() {
-    this.clearCones();
-    this.precipGeo.dispose();
-    this.precipMat.dispose();
-    this.radarTex.dispose();
-    this.isobarGeo.dispose();
-    this.isobarMat.dispose();
+    this.enabled = false;
+    this.releaseIdleMemory();
   }
 }

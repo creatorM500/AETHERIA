@@ -1095,3 +1095,14 @@ export async function getEarthquakesLast24h(): Promise<SeismicHeatmap24hResponse
     inflightQuakes24h = null;
   }
 }
+
+export function pruneWorldFeedCaches(aggressive = false): void {
+  const now = Date.now();
+  if (aggressive || (cachedQuakes24h && now - cachedQuakes24h.fetchedAt > QUAKES_24H_TTL_MS)) {
+    cachedQuakes24h = null;
+  }
+  if (aggressive || (cache && now - cache.fetchedAt > CACHE_TTL_MS)) {
+    cache = null;
+  }
+}
+

@@ -23,6 +23,7 @@ import type {
   TerrainWaterFeature,
   TerrainWaterKind,
 } from '../shared/types.ts';
+import { computePruneEvictionCount } from '../shared/memoryBudget.ts';
 
 interface CachedEntry<T> {
   value: T;
@@ -73,6 +74,50 @@ function getLru<T>(cache: Map<string, CachedEntry<T>>, key: string): T | null {
   cache.delete(key);
   cache.set(key, hit);
   return hit.value;
+}
+
+function evictOldestFromCache<T>(cache: Map<string, CachedEntry<T>>, fraction: number, minKeep = 0): number {
+  const now = Date.now();
+  let removed = 0;
+  for (const [k, entry] of cache.entries()) {
+    if (entry.expiresAt < now) {
+      cache.delete(k);
+      removed += 1;
+    }
+  }
+  const toEvict = computePruneEvictionCount(cache.size, fraction, minKeep);
+  for (let i = 0; i < toEvict; i++) {
+    const oldest = cache.keys().next().value;
+    if (!oldest) break;
+    cache.delete(oldest);
+    removed += 1;
+  }
+  return removed;
+}
+
+export function getRealTerrainCacheStats() {
+  return {
+    demTiles: demTileCache.size,
+    mvtBundles: mvtTileBundleCache.size,
+    payloads: payloadCache.size,
+    chunks: chunkCache.size,
+    hasPlanetDem: cachedPlanetDem !== null,
+  };
+}
+
+export function pruneRealTerrainCaches(fraction = 0.5): number {
+  const f = clamp(Number.isFinite(fraction) ? fraction : 0.5, 0, 1);
+  const minKeep = f >= 0.85 ? 0 : 4;
+  let removed = 0;
+  removed += evictOldestFromCache(chunkCache, f, 0);
+  removed += evictOldestFromCache(payloadCache, f, 0);
+  removed += evictOldestFromCache(mvtTileBundleCache, f, minKeep);
+  removed += evictOldestFromCache(demTileCache, f, minKeep);
+  if (f >= 0.85) {
+    cachedPlanetDem = null;
+    cachedOfmTemplate = null;
+  }
+  return removed;
 }
 
 async function getOpenFreeMapTileTemplate(): Promise<string> {
@@ -493,7 +538,7 @@ async function fetchTerrariumTileMeters(z: number, tx: number, ty: number): Prom
   }
 
   const clean = z >= 10 ? despikeDemTile256(out, false) : out;
-  setLru(demTileCache, key, clean, 30 * 60 * 1000, 140);
+  setLru(demTileCache, key, clean, 30 * 60 * 1000, 72);
   return clean;
 }
 
@@ -528,7 +573,7 @@ async function fetchVectorTileWithFallback(
         parsed.roads.length > 0 ||
         parsed.waterFeatures.length > 0
       ) {
-        setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 120);
+        setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 56);
         return { bundle: parsed, source: 'versatiles-osm' };
       }
     }
@@ -550,7 +595,7 @@ async function fetchVectorTileWithFallback(
     if (res.ok) {
       const buf = new Uint8Array(await res.arrayBuffer());
       const parsed = parseVectorTileBundle(buf, 'openfreemap', `ofm/${z}/${tx}/${ty}`);
-      setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 120);
+      setLru(mvtTileBundleCache, key, parsed, 20 * 60 * 1000, 56);
       const hasAny =
         parsed.buildings.length > 0 || parsed.roads.length > 0 || parsed.waterFeatures.length > 0;
       return { bundle: parsed, source: hasAny ? 'openfreemap-osm' : 'none' };
@@ -560,7 +605,7 @@ async function fetchVectorTileWithFallback(
   }
 
   const empty: ParsedVectorTileBundle = { buildings: [], roads: [], waterFeatures: [] };
-  setLru(mvtTileBundleCache, key, empty, 10 * 60 * 1000, 120);
+  setLru(mvtTileBundleCache, key, empty, 10 * 60 * 1000, 56);
   return { bundle: empty, source: 'none' };
 }
 
@@ -739,7 +784,7 @@ export async function getRealTerrainForCoordinate(opts: {
     fetchedAt: new Date().toISOString(),
   };
 
-  setLru(payloadCache, cacheKey, payload, 30 * 60 * 1000, 16);
+  setLru(payloadCache, cacheKey, payload, 30 * 60 * 1000, 8);
   return payload;
 }
 
@@ -880,7 +925,7 @@ export async function getTerrainChunkForTile(opts: {
     buildingsSource: keepBuildingsAndRoads ? vRes.source : 'none',
   };
 
-  setLru(chunkCache, cacheKey, payload, 25 * 60 * 1000, 96);
+  setLru(chunkCache, cacheKey, payload, 25 * 60 * 1000, 48);
   return payload;
 }
 

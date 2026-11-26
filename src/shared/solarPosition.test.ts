@@ -70,3 +70,38 @@ test('computeSolarElevationDeg and classifySolarPhase distinguish zenith day, te
   assert.ok(midnightElev < -89, `Expected ~-90° at antipode, got ${midnightElev}`);
   assert.equal(classifySolarPhase(midnightElev), 'night');
 });
+
+test('computeDayNightTransitionState smoothly interpolates Day <-> Night and staggers city lights', async () => {
+  const { computeDayNightTransitionState } = await import('./solarPosition.ts');
+
+  const start = computeDayNightTransitionState(0, true, 0.08, 1.0);
+  assert.ok(start.nextProgress > 0 && start.nextProgress < 0.15);
+  assert.ok(start.terminatorMix < start.nextProgress, 'Smootherstep eases in gently');
+  assert.equal(start.nightLightsMix, 0, 'City lights wait until dusk deepens');
+  assert.equal(start.settled, false);
+
+  let p = 0;
+  let lastMix = 0;
+  for (let i = 0; i < 20; i++) {
+    const step = computeDayNightTransitionState(p, true, 0.06, 0.95);
+    assert.ok(step.terminatorMix >= lastMix);
+    lastMix = step.terminatorMix;
+    p = step.nextProgress;
+  }
+  const doneOn = computeDayNightTransitionState(p, true, 0.06, 0.95);
+  assert.equal(doneOn.nextProgress, 1);
+  assert.equal(doneOn.terminatorMix, 1);
+  assert.equal(doneOn.nightLightsMix, 1);
+  assert.equal(doneOn.settled, true);
+
+  let q = 1;
+  for (let i = 0; i < 20; i++) {
+    q = computeDayNightTransitionState(q, false, 0.06, 0.95).nextProgress;
+  }
+  const doneOff = computeDayNightTransitionState(q, false, 0.06, 0.95);
+  assert.equal(doneOff.nextProgress, 0);
+  assert.equal(doneOff.terminatorMix, 0);
+  assert.equal(doneOff.nightLightsMix, 0);
+  assert.equal(doneOff.settled, true);
+});
+

@@ -43,7 +43,8 @@ export class GlobeWindParticleLayer {
   public readonly group = new THREE.Group();
 
   private globeRadius: number;
-  private enabled = true;
+  private enabled = false;
+  private allocated = false;
   private windField: GlobalWindFieldResponse;
   private cyclones: PreparedCycloneVortex[] = [];
   private referenceMaxMs = 20.0;
@@ -56,19 +57,19 @@ export class GlobeWindParticleLayer {
   private lastFieldSignature = '';
   private lastCyclonesSignature = '';
 
-  // Per-particle state (zero GC in render loop)
-  private nx = new Float32Array(PARTICLE_COUNT);
-  private ny = new Float32Array(PARTICLE_COUNT);
-  private nz = new Float32Array(PARTICLE_COUNT);
-  private age = new Float32Array(PARTICLE_COUNT);
-  private maxAge = new Float32Array(PARTICLE_COUNT);
-  private particleSpeedMs = new Float32Array(PARTICLE_COUNT);
-  private particleVortexIdx = new Int16Array(PARTICLE_COUNT);
-  private particleVortexBlend = new Uint8Array(PARTICLE_COUNT);
+  // Per-particle state (lazily allocated only when layer is enabled)
+  private nx: Float32Array | null = null;
+  private ny: Float32Array | null = null;
+  private nz: Float32Array | null = null;
+  private age: Float32Array | null = null;
+  private maxAge: Float32Array | null = null;
+  private particleSpeedMs: Float32Array | null = null;
+  private particleVortexIdx: Int16Array | null = null;
+  private particleVortexBlend: Uint8Array | null = null;
   // Spine ring buffer flattened: particle i, spine j (0=oldest tail .. SPINE_POINTS-1=head)
-  private spineX = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
-  private spineY = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
-  private spineZ = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
+  private spineX: Float32Array | null = null;
+  private spineY: Float32Array | null = null;
+  private spineZ: Float32Array | null = null;
 
   private readonly scratchCyclone: CycloneSampleResult = {
     vx: 0,
@@ -98,22 +99,43 @@ export class GlobeWindParticleLayer {
     cycloneAngleRad: 0.05,
   };
 
-  // GPU mesh & buffers
-  private geometry: THREE.BufferGeometry;
-  private material: THREE.ShaderMaterial;
-  private mesh: THREE.Mesh;
-  private posAttr: THREE.BufferAttribute;
-  private colAttr: THREE.BufferAttribute;
-  private alphaAttr: THREE.BufferAttribute;
-  private posArray: Float32Array;
-  private colArray: Float32Array;
-  private alphaArray: Float32Array;
+  // GPU mesh & buffers (lazily allocated)
+  private geometry: THREE.BufferGeometry | null = null;
+  private material: THREE.ShaderMaterial | null = null;
+  private mesh: THREE.Mesh | null = null;
+  private posAttr: THREE.BufferAttribute | null = null;
+  private colAttr: THREE.BufferAttribute | null = null;
+  private alphaAttr: THREE.BufferAttribute | null = null;
+  private posArray: Float32Array | null = null;
+  private colArray: Float32Array | null = null;
+  private alphaArray: Float32Array | null = null;
 
   constructor(globeRadius: number) {
     this.globeRadius = globeRadius;
     this.windField = buildAtmosphericBaselineWindField();
-    this.particleVortexIdx.fill(-1);
     this.recomputeReferenceMaxMs();
+    this.group.visible = false;
+  }
+
+  public isAllocated(): boolean {
+    return this.allocated;
+  }
+
+  private ensureAllocated() {
+    if (this.allocated) return;
+
+    this.nx = new Float32Array(PARTICLE_COUNT);
+    this.ny = new Float32Array(PARTICLE_COUNT);
+    this.nz = new Float32Array(PARTICLE_COUNT);
+    this.age = new Float32Array(PARTICLE_COUNT);
+    this.maxAge = new Float32Array(PARTICLE_COUNT);
+    this.particleSpeedMs = new Float32Array(PARTICLE_COUNT);
+    this.particleVortexIdx = new Int16Array(PARTICLE_COUNT);
+    this.particleVortexIdx.fill(-1);
+    this.particleVortexBlend = new Uint8Array(PARTICLE_COUNT);
+    this.spineX = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
+    this.spineY = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
+    this.spineZ = new Float32Array(PARTICLE_COUNT * SPINE_POINTS);
 
     const totalVerts = PARTICLE_COUNT * VERTS_PER_PARTICLE;
     const totalIndices = PARTICLE_COUNT * (SPINE_POINTS - 1) * 6;
@@ -152,7 +174,7 @@ export class GlobeWindParticleLayer {
     this.geometry.setAttribute('color', this.colAttr);
     this.geometry.setAttribute('aAlpha', this.alphaAttr);
     this.geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-    this.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), globeRadius * 1.15);
+    this.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), this.globeRadius * 1.15);
 
     this.material = new THREE.ShaderMaterial({
       uniforms: {
@@ -190,10 +212,43 @@ export class GlobeWindParticleLayer {
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = 9;
     this.group.add(this.mesh);
+    this.allocated = true;
 
+    this.assignVortexSlots();
     this.initParticles();
-    this.warmupStreamlines(16);
+    this.warmupStreamlines(16, computeWindAdvectionScale(this.lastAltitude));
     this.rebuildRibbonGeometry(this.lastAltitude);
+  }
+
+  public releaseIdleMemory() {
+    if (this.enabled || !this.allocated) return;
+    if (this.mesh) {
+      this.group.remove(this.mesh);
+      this.mesh = null;
+    }
+    this.geometry?.dispose();
+    this.material?.dispose();
+    this.geometry = null;
+    this.material = null;
+    this.posAttr = null;
+    this.colAttr = null;
+    this.alphaAttr = null;
+    this.posArray = null;
+    this.colArray = null;
+    this.alphaArray = null;
+    this.nx = null;
+    this.ny = null;
+    this.nz = null;
+    this.age = null;
+    this.maxAge = null;
+    this.particleSpeedMs = null;
+    this.particleVortexIdx = null;
+    this.particleVortexBlend = null;
+    this.spineX = null;
+    this.spineY = null;
+    this.spineZ = null;
+    this.allocated = false;
+    this.group.visible = false;
   }
 
   private recomputeReferenceMaxMs() {
@@ -205,6 +260,7 @@ export class GlobeWindParticleLayer {
   }
 
   private assignVortexSlots() {
+    if (!this.particleVortexIdx) return;
     this.particleVortexIdx.fill(-1);
     if (this.cyclones.length === 0) return;
     const perCyclone = Math.min(
@@ -222,6 +278,20 @@ export class GlobeWindParticleLayer {
   }
 
   private respawnParticle(i: number, randomAge = false) {
+    if (
+      !this.nx ||
+      !this.ny ||
+      !this.nz ||
+      !this.age ||
+      !this.maxAge ||
+      !this.particleVortexIdx ||
+      !this.particleVortexBlend ||
+      !this.spineX ||
+      !this.spineY ||
+      !this.spineZ
+    ) {
+      return;
+    }
     let px = 0;
     let py = 0;
     let pz = 1;
@@ -278,20 +348,20 @@ export class GlobeWindParticleLayer {
       pz = cosLat * Math.sin(theta);
     }
 
-    this.nx[i] = px;
-    this.ny[i] = py;
-    this.nz[i] = pz;
-    this.particleVortexBlend[i] = assignedCycloneIdx >= 0 ? 220 : 0;
+    this.nx![i] = px;
+    this.ny![i] = py;
+    this.nz![i] = pz;
+    this.particleVortexBlend![i] = assignedCycloneIdx >= 0 ? 220 : 0;
 
     const life = assignedCycloneIdx >= 0 ? 1.15 + this.rand() * 1.45 : 1.8 + this.rand() * 2.4;
-    this.maxAge[i] = life;
-    this.age[i] = randomAge ? this.rand() * life : 0;
+    this.maxAge![i] = life;
+    this.age![i] = randomAge ? this.rand() * life : 0;
 
     const baseSpine = i * SPINE_POINTS;
     for (let j = 0; j < SPINE_POINTS; j++) {
-      this.spineX[baseSpine + j] = px;
-      this.spineY[baseSpine + j] = py;
-      this.spineZ[baseSpine + j] = pz;
+      this.spineX![baseSpine + j] = px;
+      this.spineY![baseSpine + j] = py;
+      this.spineZ![baseSpine + j] = pz;
     }
   }
 
@@ -353,6 +423,20 @@ export class GlobeWindParticleLayer {
   }
 
   private advectParticle(i: number, dtSec: number, advectScale: number) {
+    if (
+      !this.nx ||
+      !this.ny ||
+      !this.nz ||
+      !this.age ||
+      !this.maxAge ||
+      !this.particleSpeedMs ||
+      !this.particleVortexBlend ||
+      !this.spineX ||
+      !this.spineY ||
+      !this.spineZ
+    ) {
+      return;
+    }
     this.age[i] += dtSec;
     let curX = this.nx[i];
     let curY = this.ny[i];
@@ -450,6 +534,7 @@ export class GlobeWindParticleLayer {
     advectScale = computeWindAdvectionScale(this.lastAltitude),
     onlyVortex = false
   ) {
+    if (!this.allocated || !this.particleVortexIdx) return;
     for (let s = 0; s < steps; s++) {
       for (let i = 0; i < PARTICLE_COUNT; i++) {
         if (onlyVortex && this.particleVortexIdx[i] < 0) continue;
@@ -459,6 +544,24 @@ export class GlobeWindParticleLayer {
   }
 
   private rebuildRibbonGeometry(altitude: number) {
+    if (
+      !this.allocated ||
+      !this.particleSpeedMs ||
+      !this.age ||
+      !this.maxAge ||
+      !this.particleVortexBlend ||
+      !this.spineX ||
+      !this.spineY ||
+      !this.spineZ ||
+      !this.posArray ||
+      !this.colArray ||
+      !this.alphaArray ||
+      !this.posAttr ||
+      !this.colAttr ||
+      !this.alphaAttr
+    ) {
+      return;
+    }
     const baseHalfWidth = clamp(altitude * 0.0026, 0.0032, 0.036);
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
@@ -556,7 +659,13 @@ export class GlobeWindParticleLayer {
 
   public setEnabled(enabled: boolean) {
     this.enabled = enabled;
-    this.group.visible = enabled;
+    if (enabled) {
+      this.ensureAllocated();
+      this.group.visible = true;
+    } else {
+      this.group.visible = false;
+      this.releaseIdleMemory();
+    }
   }
 
   public setData(field: GlobalWindFieldResponse) {
@@ -567,6 +676,7 @@ export class GlobeWindParticleLayer {
     this.lastFieldSignature = signature;
     this.windField = field;
     this.recomputeReferenceMaxMs();
+    if (!this.allocated) return;
     this.initParticles();
     this.warmupStreamlines(16, computeWindAdvectionScale(this.lastAltitude));
     this.rebuildRibbonGeometry(this.lastAltitude);
@@ -585,9 +695,10 @@ export class GlobeWindParticleLayer {
     this.lastCyclonesSignature = sig;
     this.cyclones = prepareCycloneVortices(specs);
     this.recomputeReferenceMaxMs();
+    if (!this.allocated) return;
     this.assignVortexSlots();
 
-    if (this.cyclones.length > 0) {
+    if (this.cyclones.length > 0 && this.particleVortexIdx) {
       for (let i = 0; i < PARTICLE_COUNT; i++) {
         if (this.particleVortexIdx[i] >= 0) {
           this.respawnParticle(i, true);
@@ -609,6 +720,7 @@ export class GlobeWindParticleLayer {
       this.group.visible = false;
       return;
     }
+    this.ensureAllocated();
 
     this.group.visible = altitude > 0.12;
     if (!this.group.visible) return;
@@ -622,7 +734,7 @@ export class GlobeWindParticleLayer {
 
     const advectScale = computeWindAdvectionScale(altitude);
     const isRegional = altitude < 8.5;
-    if (isRegional && (!this.wasRegionalZoom || focusMoved)) {
+    if (isRegional && (!this.wasRegionalZoom || focusMoved) && this.particleVortexIdx) {
       this.wasRegionalZoom = true;
       for (let i = 0; i < PARTICLE_COUNT; i++) {
         if (this.particleVortexIdx[i] < 0 && i % 9 < 4) this.respawnParticle(i, true);
@@ -633,7 +745,9 @@ export class GlobeWindParticleLayer {
     }
 
     const closeFade = clamp((altitude - 0.12) / 0.35, 0, 1);
-    this.material.uniforms.uGlobalOpacity.value = 0.95 * closeFade;
+    if (this.material) {
+      this.material.uniforms.uGlobalOpacity.value = 0.95 * closeFade;
+    }
 
     const dt = clamp(deltaSec, 0.014, 0.055);
 
@@ -644,8 +758,8 @@ export class GlobeWindParticleLayer {
   }
 
   public dispose() {
-    this.geometry.dispose();
-    this.material.dispose();
+    this.enabled = false;
+    this.releaseIdleMemory();
   }
 }
 

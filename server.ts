@@ -18,7 +18,12 @@ import type {
   PredictiveRouteResult,
   TravelMode,
 } from './src/shared/types.ts';
-import { getEarthquakesLast24h, getWorldFeed } from './src/server/worldFeed.ts';
+import {
+  evaluateMemoryBudget,
+  SERVER_HARD_PRUNE_MB,
+  SERVER_SOFT_PRUNE_MB,
+} from './src/shared/memoryBudget.ts';
+import { getEarthquakesLast24h, getWorldFeed, pruneWorldFeedCaches } from './src/server/worldFeed.ts';
 import { getGlobalWindField } from './src/server/windFeed.ts';
 import { getGlobalWeatherRadar } from './src/server/weatherRadarFeed.ts';
 import {
@@ -30,8 +35,10 @@ import {
 } from './src/server/disasterHistory.ts';
 import {
   getPlanetaryDemGrid,
+  getRealTerrainCacheStats,
   getRealTerrainForCoordinate,
   getTerrainChunkForTile,
+  pruneRealTerrainCaches,
 } from './src/server/realTerrain.ts';
 import { handleMcpRequest, MCP_SERVER_INFO, MCP_TOOLS } from './src/server/mcpServer.ts';
 
@@ -96,15 +103,52 @@ function parseGoogleDurationSeconds(dur?: string): number {
   return Number.isFinite(num) ? Math.round(num) : 0;
 }
 
+function enforceServerMemoryBudget() {
+  const mem = process.memoryUsage();
+  const rssMb = mem.rss / (1024 * 1024);
+  const heapUsedMb = mem.heapUsed / (1024 * 1024);
+  const budget = evaluateMemoryBudget(rssMb, SERVER_SOFT_PRUNE_MB, SERVER_HARD_PRUNE_MB);
+  if (budget.pressure === 'soft') {
+    pruneRealTerrainCaches(budget.pruneFraction);
+    pruneWorldFeedCaches(false);
+  } else if (budget.pressure === 'critical') {
+    pruneRealTerrainCaches(0.95);
+    pruneWorldFeedCaches(true);
+    const maybeGc = (globalThis as { gc?: () => void }).gc;
+    if (typeof maybeGc === 'function') {
+      try {
+        maybeGc();
+      } catch {
+        // Ignore
+      }
+    }
+  }
+  return {
+    rssMb: Number(rssMb.toFixed(1)),
+    heapUsedMb: Number(heapUsedMb.toFixed(1)),
+    ceilingMb: budget.ceilingMb,
+    headroomMb: budget.headroomMb,
+    pressure: budget.pressure,
+    terrainCaches: getRealTerrainCacheStats(),
+  };
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
+  const watchdogTimer = setInterval(() => {
+    enforceServerMemoryBudget();
+  }, 30_000);
+  watchdogTimer.unref?.();
+
   app.get('/api/health', (_req, res) => {
+    const memory = enforceServerMemoryBudget();
     res.json({
       status: 'ok',
       service: 'aetheria-global',
       timestamp: new Date().toISOString(),
+      memory,
     });
   });
 
@@ -246,6 +290,7 @@ async function startServer() {
         includeBuildings,
       });
       res.json(chunk);
+      enforceServerMemoryBudget();
     } catch (error) {
       console.error('Terrain chunk fetch error:', error);
       res.status(500).json({ error: 'No se pudo obtener el fragmento 3D.' });

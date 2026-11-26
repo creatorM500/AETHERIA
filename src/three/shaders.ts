@@ -3,6 +3,7 @@ import * as THREE from 'three';
 export interface GlobeSolarUniforms {
   uSunDir: { value: THREE.Vector3 };
   uTerminatorEnabled: { value: number };
+  uNightLightsMix: { value: number };
   uNightLightsMap: { value: THREE.Texture };
   uNightLightsIntensity: { value: number };
   uPlanetRoughnessMap: { value: THREE.Texture };
@@ -52,11 +53,13 @@ export function createAtmosphereMaterial(
         float twilightBand = exp(-pow((sunDot + 0.02) / 0.135, 2.0)) * terminatorStrength;
 
         float fresnel = pow(rim, 3.15);
-        vec3 baseCol = mix(twilightColor, glowColor, dayFactor);
+        float effTerm = clamp(terminatorStrength, 0.0, 1.0);
+        float effDay = mix(0.88, dayFactor, effTerm);
+        vec3 baseCol = mix(twilightColor, glowColor, effDay);
         vec3 scatterCol = mix(baseCol, twilightScatterColor, clamp(twilightBand * 0.84, 0.0, 0.86));
 
-        float nightFloor = mix(0.22, 0.075, terminatorStrength);
-        float alpha = fresnel * intensity * mix(nightFloor, 1.0, max(dayFactor, twilightBand * 0.90));
+        float nightFloor = mix(0.75, 0.075, effTerm);
+        float alpha = fresnel * intensity * mix(nightFloor, 1.0, max(effDay, twilightBand * 0.90));
         gl_FragColor = vec4(scatterCol, alpha);
       }
     `,
@@ -108,10 +111,12 @@ export function createOuterHaloMaterial(
         float limb = pow(clamp(0.69 - viewDot, 0.0, 1.0), 3.3);
         float sunDot = dot(normalize(vWorldNormal), normalize(sunDir));
         float dayFactor = smoothstep(-0.26, 0.50, sunDot);
-        float twilightBand = exp(-pow((sunDot + 0.015) / 0.155, 2.0)) * terminatorStrength;
+        float effTerm = clamp(terminatorStrength, 0.0, 1.0);
+        float effDay = mix(0.88, dayFactor, effTerm);
+        float twilightBand = exp(-pow((sunDot + 0.015) / 0.155, 2.0)) * effTerm;
         vec3 col = mix(glowColor, twilightScatterColor, clamp(twilightBand * 0.62, 0.0, 0.68));
-        float nightFloor = mix(0.22, 0.065, terminatorStrength);
-        float alpha = limb * intensity * mix(nightFloor, 1.0, max(dayFactor, twilightBand * 0.76));
+        float nightFloor = mix(0.75, 0.065, effTerm);
+        float alpha = limb * intensity * mix(nightFloor, 1.0, max(effDay, twilightBand * 0.76));
         gl_FragColor = vec4(col, alpha);
       }
     `,
@@ -131,10 +136,11 @@ export function applyGlobeTerminatorShader(
   material: THREE.MeshStandardMaterial,
   solarUniforms: GlobeSolarUniforms
 ): void {
-  material.customProgramCacheKey = () => 'globe-solar-terminator-v2';
+  material.customProgramCacheKey = () => 'globe-solar-terminator-v4';
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uSunDir = solarUniforms.uSunDir;
     shader.uniforms.uTerminatorEnabled = solarUniforms.uTerminatorEnabled;
+    shader.uniforms.uNightLightsMix = solarUniforms.uNightLightsMix;
     shader.uniforms.uNightLightsMap = solarUniforms.uNightLightsMap;
     shader.uniforms.uNightLightsIntensity = solarUniforms.uNightLightsIntensity;
 
@@ -161,48 +167,56 @@ export function applyGlobeTerminatorShader(
         varying vec3 vTermViewDirWorld;
         uniform vec3 uSunDir;
         uniform float uTerminatorEnabled;
+        uniform float uNightLightsMix;
         uniform sampler2D uNightLightsMap;
         uniform float uNightLightsIntensity;`
       )
       .replace(
         '#include <opaque_fragment>',
-        `if (uTerminatorEnabled > 0.5) {
-          vec3 wNorm = normalize(vTermWorldNormal);
-          vec3 viewDirW = normalize(vTermViewDirWorld);
+        `float termMix = clamp(uTerminatorEnabled, 0.0, 1.0);
+        vec3 wNorm = normalize(vTermWorldNormal);
+        vec3 viewDirW = normalize(vTermViewDirWorld);
+        float ndv = max(0.0, dot(wNorm, viewDirW));
+        float limbFresnel = pow(1.0 - ndv, 2.65);
+        vec3 uniformDayLight = mix(diffuseColor.rgb * 0.94, outgoingLight, 0.35) + vec3(0.18, 0.48, 0.92) * limbFresnel * 0.16;
+
+        if (termMix > 0.001) {
           vec3 sunDirN = normalize(uSunDir);
           float sunDot = dot(wNorm, sunDirN);
-          float dayMask = smoothstep(-0.12, 0.16, sunDot);
-          float nightMask = smoothstep(0.06, -0.17, sunDot);
-          float goldenBand = exp(-pow((sunDot - 0.015) / 0.078, 2.0));
-          float copperBand = exp(-pow((sunDot + 0.055) / 0.088, 2.0));
-
-          float ndv = max(0.0, dot(wNorm, viewDirW));
-          float limbFresnel = pow(1.0 - ndv, 2.65);
+          // Smooth terminator sweep from antisolar limb toward live UTC terminator
+          float effectiveSunDot = sunDot + (1.0 - termMix) * 1.15;
+          float dayMask = smoothstep(-0.12, 0.16, effectiveSunDot);
+          float nightMask = smoothstep(0.06, -0.17, effectiveSunDot);
+          float goldenBand = exp(-pow((effectiveSunDot - 0.015) / 0.078, 2.0));
+          float copperBand = exp(-pow((effectiveSunDot + 0.055) / 0.088, 2.0));
+          float twilightWave = smoothstep(0.0, 0.22, termMix);
 
           // Orbital ocean solar sunglint masked strictly to smooth water via roughnessFactor
           vec3 halfVec = normalize(sunDirN + viewDirW);
           float oceanMask = smoothstep(0.68, 0.44, roughnessFactor);
           float sunglint = pow(max(0.0, dot(wNorm, halfVec)), 84.0) * oceanMask * dayMask;
-          vec3 litDay = outgoingLight + vec3(1.0, 0.94, 0.82) * sunglint * 0.30;
+          vec3 litDay = mix(uniformDayLight, outgoingLight, dayMask) + vec3(1.0, 0.94, 0.82) * sunglint * 0.30;
 
           // Subtle Rayleigh atmospheric aerial perspective across sunlit globe limbs
-          litDay += vec3(0.22, 0.54, 0.96) * limbFresnel * dayMask * 0.24;
+          litDay += vec3(0.22, 0.54, 0.96) * limbFresnel * dayMask * 0.20;
 
           vec3 nightBase = diffuseColor.rgb * vec3(0.045, 0.082, 0.175) + vec3(0.004, 0.008, 0.018);
           nightBase += vec3(0.018, 0.036, 0.085) * pow(1.0 - ndv, 2.2) * nightMask;
 
           vec3 surfaceCol = mix(nightBase, litDay, dayMask);
-          vec3 twilightCol = vec3(1.0, 0.56, 0.18) * goldenBand * 0.22 + vec3(0.92, 0.30, 0.12) * copperBand * 0.18;
-          surfaceCol += twilightCol * (0.42 + 0.58 * diffuseColor.rgb);
+          vec3 twilightCol = vec3(1.0, 0.56, 0.18) * goldenBand * 0.24 + vec3(0.92, 0.30, 0.12) * copperBand * 0.19;
+          surfaceCol += twilightCol * twilightWave * (0.42 + 0.58 * diffuseColor.rgb);
 
           #ifdef USE_MAP
             vec3 cityLights = texture2D(uNightLightsMap, vMapUv).rgb;
             float cityCore = smoothstep(0.18, 0.85, max(cityLights.r, max(cityLights.g, cityLights.b)));
             vec3 warmCity = mix(cityLights * 0.92, cityLights * vec3(1.18, 1.04, 0.82), cityCore);
-            surfaceCol += warmCity * nightMask * uNightLightsIntensity;
+            surfaceCol += warmCity * nightMask * clamp(uNightLightsMix, 0.0, 1.0) * uNightLightsIntensity;
           #endif
 
-          outgoingLight = surfaceCol;
+          outgoingLight = mix(uniformDayLight, surfaceCol, termMix);
+        } else {
+          outgoingLight = uniformDayLight;
         }
         #include <opaque_fragment>`
       );
@@ -217,10 +231,11 @@ export function applyRegionalTileTerminatorShader(
   material: THREE.MeshStandardMaterial,
   solarUniforms: GlobeSolarUniforms
 ): void {
-  material.customProgramCacheKey = () => 'regional-tile-terminator-v3';
+  material.customProgramCacheKey = () => 'regional-tile-terminator-v5';
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uSunDir = solarUniforms.uSunDir;
     shader.uniforms.uTerminatorEnabled = solarUniforms.uTerminatorEnabled;
+    shader.uniforms.uNightLightsMix = solarUniforms.uNightLightsMix;
     shader.uniforms.uNightLightsMap = solarUniforms.uNightLightsMap;
     shader.uniforms.uNightLightsIntensity = solarUniforms.uNightLightsIntensity;
     shader.uniforms.uPlanetRoughnessMap = solarUniforms.uPlanetRoughnessMap;
@@ -248,21 +263,29 @@ export function applyRegionalTileTerminatorShader(
         varying vec3 vTileViewDirWorld;
         uniform vec3 uSunDir;
         uniform float uTerminatorEnabled;
+        uniform float uNightLightsMix;
         uniform sampler2D uNightLightsMap;
         uniform float uNightLightsIntensity;
         uniform sampler2D uPlanetRoughnessMap;`
       )
       .replace(
         '#include <opaque_fragment>',
-        `if (uTerminatorEnabled > 0.5) {
-          vec3 wNorm = normalize(vTileGlobeNormal);
-          vec3 viewDirW = normalize(vTileViewDirWorld);
+        `float termMix = clamp(uTerminatorEnabled, 0.0, 1.0);
+        vec3 wNorm = normalize(vTileGlobeNormal);
+        vec3 viewDirW = normalize(vTileViewDirWorld);
+        float ndv = max(0.0, dot(wNorm, viewDirW));
+        float limbFresnel = pow(1.0 - ndv, 2.65);
+        vec3 uniformDayLight = mix(diffuseColor.rgb * 0.94, outgoingLight, 0.35) + vec3(0.18, 0.46, 0.88) * limbFresnel * 0.14;
+
+        if (termMix > 0.001) {
           vec3 sunDirN = normalize(uSunDir);
           float sunDot = dot(wNorm, sunDirN);
-          float dayMask = smoothstep(-0.12, 0.16, sunDot);
-          float nightMask = smoothstep(0.06, -0.17, sunDot);
-          float goldenBand = exp(-pow((sunDot - 0.015) / 0.078, 2.0));
-          float copperBand = exp(-pow((sunDot + 0.055) / 0.088, 2.0));
+          float effectiveSunDot = sunDot + (1.0 - termMix) * 1.15;
+          float dayMask = smoothstep(-0.12, 0.16, effectiveSunDot);
+          float nightMask = smoothstep(0.06, -0.17, effectiveSunDot);
+          float goldenBand = exp(-pow((effectiveSunDot - 0.015) / 0.078, 2.0));
+          float copperBand = exp(-pow((effectiveSunDot + 0.055) / 0.088, 2.0));
+          float twilightWave = smoothstep(0.0, 0.22, termMix);
 
           vec2 equirectUv = vec2(
             atan(-wNorm.z, wNorm.x) / 6.28318530718 + 0.5,
@@ -273,24 +296,24 @@ export function applyRegionalTileTerminatorShader(
           float oceanMask = smoothstep(0.68, 0.44, planetRough);
           float sunglint = pow(max(0.0, dot(wNorm, halfVec)), 84.0) * oceanMask * dayMask;
 
-          float ndv = max(0.0, dot(wNorm, viewDirW));
-          float limbFresnel = pow(1.0 - ndv, 2.65);
-          vec3 litDay = outgoingLight + vec3(1.0, 0.94, 0.82) * sunglint * 0.28;
-          litDay += vec3(0.20, 0.50, 0.92) * limbFresnel * dayMask * 0.20;
+          vec3 litDay = mix(uniformDayLight, outgoingLight, dayMask) + vec3(1.0, 0.94, 0.82) * sunglint * 0.28;
+          litDay += vec3(0.20, 0.50, 0.92) * limbFresnel * dayMask * 0.18;
 
           vec3 nightBase = diffuseColor.rgb * vec3(0.045, 0.082, 0.175) + vec3(0.004, 0.008, 0.018);
           nightBase += vec3(0.018, 0.036, 0.085) * pow(1.0 - ndv, 2.2) * nightMask;
 
           vec3 surfaceCol = mix(nightBase, litDay, dayMask);
-          vec3 twilightCol = vec3(1.0, 0.54, 0.18) * goldenBand * 0.20 + vec3(0.90, 0.28, 0.12) * copperBand * 0.16;
-          surfaceCol += twilightCol * (0.42 + 0.58 * diffuseColor.rgb);
+          vec3 twilightCol = vec3(1.0, 0.54, 0.18) * goldenBand * 0.22 + vec3(0.90, 0.28, 0.12) * copperBand * 0.17;
+          surfaceCol += twilightCol * twilightWave * (0.42 + 0.58 * diffuseColor.rgb);
 
           vec3 cityLights = texture2D(uNightLightsMap, equirectUv).rgb;
           float cityCore = smoothstep(0.18, 0.85, max(cityLights.r, max(cityLights.g, cityLights.b)));
           vec3 warmCity = mix(cityLights * 0.92, cityLights * vec3(1.18, 1.04, 0.82), cityCore);
-          surfaceCol += warmCity * nightMask * uNightLightsIntensity;
+          surfaceCol += warmCity * nightMask * clamp(uNightLightsMix, 0.0, 1.0) * uNightLightsIntensity;
 
-          outgoingLight = surfaceCol;
+          outgoingLight = mix(uniformDayLight, surfaceCol, termMix);
+        } else {
+          outgoingLight = uniformDayLight;
         }
         #include <opaque_fragment>`
       );
@@ -305,7 +328,7 @@ export function applyCloudTerminatorShader(
   material: THREE.MeshStandardMaterial,
   solarUniforms: GlobeSolarUniforms
 ): void {
-  material.customProgramCacheKey = () => 'cloud-solar-terminator-v2';
+  material.customProgramCacheKey = () => 'cloud-solar-terminator-v4';
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uSunDir = solarUniforms.uSunDir;
     shader.uniforms.uTerminatorEnabled = solarUniforms.uTerminatorEnabled;
@@ -332,13 +355,18 @@ export function applyCloudTerminatorShader(
       )
       .replace(
         '#include <opaque_fragment>',
-        `if (uTerminatorEnabled > 0.5) {
+        `float termMix = clamp(uTerminatorEnabled, 0.0, 1.0);
+        vec3 uniformDayCloud = max(outgoingLight, diffuseColor.rgb * 0.90);
+        if (termMix > 0.001) {
           float sunDot = dot(normalize(vCloudWorldNormal), normalize(uSunDir));
-          float cloudDay = smoothstep(-0.15, 0.21, sunDot);
-          float cloudTwilight = exp(-pow((sunDot + 0.015) / 0.105, 2.0));
+          float effectiveSunDot = sunDot + (1.0 - termMix) * 1.15;
+          float cloudDay = smoothstep(-0.15, 0.21, effectiveSunDot);
+          float cloudTwilight = exp(-pow((effectiveSunDot + 0.015) / 0.105, 2.0)) * smoothstep(0.0, 0.25, termMix);
           vec3 nightCloud = diffuseColor.rgb * vec3(0.035, 0.062, 0.13);
-          outgoingLight = mix(nightCloud, outgoingLight * 1.06, cloudDay);
-          outgoingLight += vec3(1.0, 0.50, 0.20) * cloudTwilight * 0.32;
+          vec3 cloudTarget = mix(nightCloud, outgoingLight * 1.06, cloudDay) + vec3(1.0, 0.50, 0.20) * cloudTwilight * 0.32;
+          outgoingLight = mix(uniformDayCloud, cloudTarget, termMix);
+        } else {
+          outgoingLight = uniformDayCloud;
         }
         #include <opaque_fragment>`
       );

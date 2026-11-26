@@ -91,3 +91,51 @@ export function classifySolarPhase(elevationDeg: number): SolarPhase {
   if (elevationDeg >= -12.0) return 'twilight';
   return 'night';
 }
+
+export interface DayNightTransitionState {
+  /** Linear normalized progress in [0, 1] for internal stepping */
+  nextProgress: number;
+  /** C2-continuous quintic eased mix [0, 1] driving terminator shadow + lighting interpolation */
+  terminatorMix: number;
+  /** Staggered city-light ignition curve [0, 1] that glows in behind twilight */
+  nightLightsMix: number;
+  /** True once progress reaches its 0 or 1 target */
+  settled: boolean;
+}
+
+/**
+ * Advances the Day/Night visualization state smoothly toward ON (1) or OFF (0)
+ * over ~0.95s using quintic smootherstep easing and staggered nocturnal city-light fade.
+ */
+export function computeDayNightTransitionState(
+  currentProgress: number,
+  targetEnabled: boolean,
+  deltaSec: number,
+  durationSec = 0.95
+): DayNightTransitionState {
+  const safeProgress = clamp(Number.isFinite(currentProgress) ? currentProgress : 0, 0, 1);
+  const target = targetEnabled ? 1 : 0;
+  const safeDelta = clamp(Number.isFinite(deltaSec) ? deltaSec : 0, 0, 0.12);
+  const step = safeDelta / Math.max(0.25, durationSec);
+
+  let nextProgress: number;
+  if (Math.abs(target - safeProgress) <= Math.max(0.002, step)) {
+    nextProgress = target;
+  } else {
+    nextProgress = clamp(safeProgress + (target > safeProgress ? step : -step), 0, 1);
+  }
+
+  // Quintic C2-continuous smootherstep for silk-smooth start & landing
+  const terminatorMix =
+    nextProgress * nextProgress * nextProgress * (nextProgress * (nextProgress * 6 - 15) + 10);
+  // Night lights turn on cleanly once dusk settles and fade out promptly as sun sweeps back
+  const nightLightsMix = clamp((terminatorMix - 0.16) / 0.84, 0, 1);
+
+  return {
+    nextProgress,
+    terminatorMix,
+    nightLightsMix,
+    settled: nextProgress === target,
+  };
+}
+
